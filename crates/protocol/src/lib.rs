@@ -60,7 +60,10 @@ pub enum Request {
     /// Retrieve current alert rules and quiet-mode state; returns [`Response::AlertConfig`].
     GetAlertConfig,
     /// Add or update an alert rule keyed by `window_minutes`. Returns [`Response::Ok`].
-    SetAlertRule { window_minutes: u32, threshold_bytes: u64 },
+    SetAlertRule {
+        window_minutes: u32,
+        threshold_bytes: u64,
+    },
     /// Remove an alert rule by id. Returns [`Response::Ok`] or [`Response::Error`].
     DeleteAlertRule { rule_id: i64 },
     /// Silence alerts until `until_unix` (Unix seconds); `None` clears quiet mode.
@@ -78,18 +81,25 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Pong { version: String, protocol: u32 },
+    Pong {
+        version: String,
+        protocol: u32,
+    },
     Summary(Summary),
     Live(LiveSnapshot),
     AppHistory(AppHistory),
-    Networks { networks: Vec<NetworkInfo> },
+    Networks {
+        networks: Vec<NetworkInfo>,
+    },
     AlertConfig {
         rules: Vec<AlertRule>,
         /// When set, alerts are silenced until this Unix timestamp.
         quiet_until: Option<i64>,
     },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

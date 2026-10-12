@@ -294,10 +294,7 @@ impl Store {
                 bytes_out = bytes_out + excluded.bytes_out",
             params![cutoff],
         )?;
-        tx.execute(
-            "DELETE FROM usage_hour WHERE hour_ts < ?1",
-            params![cutoff],
-        )?;
+        tx.execute("DELETE FROM usage_hour WHERE hour_ts < ?1", params![cutoff])?;
         tx.commit()?;
         Ok(())
     }
@@ -598,7 +595,9 @@ mod tests {
         let old_ts = now.timestamp() - 10 * 86_400;
         let old_minute = old_ts - old_ts.rem_euclid(60);
         let app = s.upsert_app("app", "App", None, old_ts).unwrap();
-        let net = s.upsert_network("eth0", None, Metered::Yes, old_ts).unwrap();
+        let net = s
+            .upsert_network("eth0", None, Metered::Yes, old_ts)
+            .unwrap();
         s.add_usage(&[UsageRow {
             app_id: app,
             network_id: net,

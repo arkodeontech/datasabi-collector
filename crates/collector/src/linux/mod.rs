@@ -130,7 +130,9 @@ impl Engine {
             let quiet = store.get_quiet_until()?.unwrap_or(0);
             (rules, quiet)
         };
-        shared.quiet_until.store(quiet_until_val, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .quiet_until
+            .store(quiet_until_val, std::sync::atomic::Ordering::Relaxed);
 
         let mut agg = Aggregator::new(rules);
         // Rebuild alert windows from the last hour so a restart does not reset them.

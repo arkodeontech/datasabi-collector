@@ -214,12 +214,7 @@ pub fn handle_request(shared: &Shared, req: Request) -> Response {
                 Response::Ok
             }
             Request::DeleteAlertRule { rule_id } => {
-                if shared
-                    .store
-                    .lock()
-                    .unwrap()
-                    .delete_alert_rule(rule_id)?
-                {
+                if shared.store.lock().unwrap().delete_alert_rule(rule_id)? {
                     shared
                         .rules_dirty
                         .store(true, std::sync::atomic::Ordering::Relaxed);
