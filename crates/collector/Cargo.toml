@@ -1,0 +1,72 @@
+[package]
+name = "datasabi-collector"
+description = "Privileged service that measures per-app network data usage for DataSabi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "datasabi-collector"
+path = "src/main.rs"
+
+[[bin]]
+name = "dsctl"
+path = "src/bin/dsctl.rs"
+
+[dependencies]
+datasabi-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pcap = "2"
+nix = { version = "0.29", features = ["user", "fs"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# `cargo deb -p datasabi-collector` (cargo install cargo-deb)
+[package.metadata.deb]
+name = "datasabi-collector"
+maintainer = "Arkodeon Technologies Ltd <isaac@arkodeon.com>"
+copyright = "2026, Arkodeon Technologies Ltd"
+section = "net"
+priority = "optional"
+depends = "$auto, passwd, systemd"
+extended-description = """\
+Background service for DataSabi. It measures how much internet data each app \
+uses, keeps the history on this computer, and warns when an app uses a lot of \
+data on a metered connection. Nothing is sent over the internet."""
+maintainer-scripts = "../../packaging/linux/debian/"
+assets = [
+    ["target/release/datasabi-collector", "usr/lib/datasabi/", "755"],
+    ["target/release/dsctl", "usr/bin/", "755"],
+    ["../../packaging/linux/datasabi-collector.service", "usr/lib/systemd/system/", "644"],
+    ["../../README.md", "usr/share/doc/datasabi-collector/README.md", "644"],
+]
+
+# `cargo generate-rpm -p crates/collector` (cargo install cargo-generate-rpm)
+[package.metadata.generate-rpm]
+name = "datasabi-collector"
+summary = "Per-app internet data usage collector for DataSabi"
+post_install_script = "packaging/linux/postinst.sh"
+pre_uninstall_script = "packaging/linux/prerm.sh"
+assets = [
+    { source = "target/release/datasabi-collector", dest = "/usr/lib/datasabi/datasabi-collector", mode = "755" },
+    { source = "target/release/dsctl", dest = "/usr/bin/dsctl", mode = "755" },
+    { source = "packaging/linux/datasabi-collector.service", dest = "/usr/lib/systemd/system/datasabi-collector.service", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+libpcap = "*"
+shadow-utils = "*"
