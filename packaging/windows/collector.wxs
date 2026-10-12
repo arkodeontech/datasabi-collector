@@ -1,0 +1,24 @@
+<!-- WiX v4 fragment: installs the DataSabi collector as a Windows service. Not built yet. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <ComponentGroup Id="DataSabiCollector" Directory="INSTALLFOLDER">
+      <Component Id="CollectorExe" Guid="*">
+        <File Id="CollectorExeFile" Source="datasabi-collector.exe" KeyPath="yes" />
+        <ServiceInstall Id="CollectorService"
+                        Name="DataSabiCollector"
+                        DisplayName="DataSabi Collector"
+                        Description="Measures per-app internet data usage for DataSabi. Data stays on this PC."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem" />
+        <ServiceControl Id="CollectorServiceControl"
+                        Name="DataSabiCollector"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

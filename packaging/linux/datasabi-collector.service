@@ -1,0 +1,46 @@
+[Unit]
+Description=DataSabi collector (per-app internet data usage)
+Documentation=https://github.com/zieeco/datasabi-collector
+After=network.target NetworkManager.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=datasabi
+Group=datasabi
+ExecStart=/usr/lib/datasabi/datasabi-collector --db /var/lib/datasabi/usage.db --socket /run/datasabi/collector.sock --socket-group datasabi
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+# Only the capabilities needed to watch packets and map them to processes.
+#   CAP_NET_RAW, CAP_NET_ADMIN: packet capture (libpcap)
+#   CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH: read /proc/<pid>/fd and /proc/<pid>/exe of other users
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+RuntimeDirectory=datasabi
+RuntimeDirectoryMode=0755
+StateDirectory=datasabi
+StateDirectoryMode=0750
+
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
