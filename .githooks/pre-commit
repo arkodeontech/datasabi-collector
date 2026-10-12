@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# Only check staged Rust files.
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+echo "→ cargo fmt --check"
+cargo fmt --all --check
+
+echo "→ cargo clippy"
+cargo clippy --all-targets -- -D warnings
