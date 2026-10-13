@@ -306,12 +306,17 @@ fn interpreter_script(exe: &str, cmdline: &[u8]) -> Option<String> {
     if !is_interpreter(exe) {
         return None;
     }
-    cmdline
+    let script = cmdline
         .split(|b| *b == 0)
         .skip(1)
         .filter_map(|a| std::str::from_utf8(a).ok())
-        .find(|a| !a.is_empty() && !a.starts_with('-'))
-        .map(str::to_string)
+        .find(|a| !a.is_empty() && !a.starts_with('-'))?;
+    // Reject inline expressions (node -e "code" / python -c "code"); only accept file paths.
+    if script.contains('/') || script.ends_with(".js") || script.ends_with(".py") || script.ends_with(".sh") || script.ends_with(".rb") || script.ends_with(".ts") {
+        Some(script.to_string())
+    } else {
+        None
+    }
 }
 
 /// "gnome-software" -> "Gnome software", "/x/MyTool.AppImage" -> "MyTool".
