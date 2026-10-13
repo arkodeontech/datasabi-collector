@@ -1,6 +1,6 @@
 [Unit]
 Description=DataSabi collector (per-app internet data usage)
-Documentation=https://github.com/zieeco/datasabi-collector
+Documentation=https://github.com/arkodeontech/datasabi-collector
 After=network.target NetworkManager.service
 Wants=network.target
 
