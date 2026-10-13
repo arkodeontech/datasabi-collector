@@ -85,6 +85,10 @@ const BUILTIN_NAMES: &[(&str, &str)] = &[
     ("dropbox", "Dropbox"),
     ("chrome", "Google Chrome"),
     ("msedge", "Microsoft Edge"),
+    ("qemu-system-x86_64", "Android Emulator (QEMU)"),
+    ("qemu-system-aarch64", "Android Emulator (QEMU)"),
+    ("qemu-system-i386", "QEMU VM"),
+    ("qemu-system-arm", "QEMU VM"),
 ];
 
 #[derive(Debug, Default)]
@@ -302,6 +306,20 @@ fn is_interpreter(path: &str) -> bool {
     })
 }
 
+/// Special names for JVM processes identified by their command line.
+fn java_cmdline_name(cmdline: &[u8]) -> Option<&'static str> {
+    let text = std::str::from_utf8(cmdline)
+        .unwrap_or("")
+        .replace('\0', " ");
+    if text.contains("GradleDaemon")
+        || text.contains("gradle-launcher")
+        || text.contains("GradleWorkerMain")
+    {
+        return Some("Gradle (Android builds)");
+    }
+    None
+}
+
 fn interpreter_script(exe: &str, cmdline: &[u8]) -> Option<String> {
     if !is_interpreter(exe) {
         return None;
@@ -312,7 +330,13 @@ fn interpreter_script(exe: &str, cmdline: &[u8]) -> Option<String> {
         .filter_map(|a| std::str::from_utf8(a).ok())
         .find(|a| !a.is_empty() && !a.starts_with('-'))?;
     // Reject inline expressions (node -e "code" / python -c "code"); only accept file paths.
-    if script.contains('/') || script.ends_with(".js") || script.ends_with(".py") || script.ends_with(".sh") || script.ends_with(".rb") || script.ends_with(".ts") {
+    if script.contains('/')
+        || script.ends_with(".js")
+        || script.ends_with(".py")
+        || script.ends_with(".sh")
+        || script.ends_with(".rb")
+        || script.ends_with(".ts")
+    {
         Some(script.to_string())
     } else {
         None
@@ -406,6 +430,20 @@ impl AppResolver {
             return AppInfo::unknown();
         };
         let mut info = self.name(&identity, exe.clone());
+
+        // For JVM processes, try cmdline-based name lookup before falling back.
+        if info.name.is_empty() {
+            if let Some(ref exe_path) = exe {
+                if is_interpreter(exe_path) {
+                    if let Ok(cmdline) = fs::read(proc.join("cmdline")) {
+                        if let Some(n) = java_cmdline_name(&cmdline) {
+                            info.name = n.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
         if info.name.is_empty() && self.built_at.elapsed() > Duration::from_secs(60) {
             // Maybe the app was just installed.
             self.index = DesktopIndex::build();
