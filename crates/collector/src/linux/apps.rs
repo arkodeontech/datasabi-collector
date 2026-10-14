@@ -89,6 +89,10 @@ const BUILTIN_NAMES: &[(&str, &str)] = &[
     ("qemu-system-aarch64", "Android Emulator (QEMU)"),
     ("qemu-system-i386", "QEMU VM"),
     ("qemu-system-arm", "QEMU VM"),
+    ("claude", "Claude Code"),
+    ("claude.exe", "Claude Code"),
+    ("code", "Visual Studio Code"),
+    ("node", "Node.js"),
 ];
 
 #[derive(Debug, Default)]
@@ -101,7 +105,7 @@ struct DesktopIndex {
 
 impl DesktopIndex {
     fn build() -> Self {
-        let mut idx = DesktopIndex::default();
+        let mut files: Vec<(String, String)> = Vec::new();
         let mut dirs: Vec<PathBuf> = DESKTOP_DIRS.iter().map(PathBuf::from).collect();
         if let Ok(homes) = fs::read_dir("/home") {
             for h in homes.flatten() {
@@ -123,17 +127,33 @@ impl DesktopIndex {
                 }
                 if let Ok(text) = fs::read_to_string(&path) {
                     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    idx.add(stem, &text);
+                    files.push((stem.to_string(), text));
                 }
             }
+        }
+        Self::from_files(files.iter().map(|(s, t)| (s.as_str(), t.as_str())))
+    }
+
+    /// Main entries are indexed before hidden/handler entries. Every map uses
+    /// first-wins inserts, so e.g. code.desktop ("Visual Studio Code") beats
+    /// code-url-handler.desktop no matter which file the directory listing returns first.
+    fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut idx = DesktopIndex::default();
+        let (main, secondary): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .filter_map(|(stem, text)| parse_desktop(text).map(|e| (stem, e)))
+            .partition(|(stem, e)| !is_secondary(stem, e));
+        for (stem, entry) in main {
+            idx.insert(stem, entry);
+        }
+        for (stem, mut entry) in secondary {
+            entry.name = strip_handler_suffix(&entry.name);
+            idx.insert(stem, entry);
         }
         idx
     }
 
-    fn add(&mut self, file_stem: &str, text: &str) {
-        let Some(entry) = parse_desktop(text) else {
-            return;
-        };
+    fn insert(&mut self, file_stem: &str, entry: DesktopEntry) {
         let name = entry.name;
         // Flatpak exports are named <app-id>.desktop; snap ones <snap>_<app>.desktop.
         self.by_id
@@ -201,11 +221,38 @@ struct DesktopEntry {
     program: Option<String>,
     flatpak_id: Option<String>,
     wm_class: Option<String>,
+    no_display: bool,
+    hidden: bool,
+}
+
+/// Hidden launchers and URL/MIME handlers name the same program as the main
+/// entry, but with a worse name ("Visual Studio Code - URL Handler").
+fn is_secondary(file_stem: &str, entry: &DesktopEntry) -> bool {
+    entry.no_display
+        || entry.hidden
+        || file_stem.ends_with("-handler")
+        || entry.name.to_lowercase().contains("url handler")
+}
+
+/// "Visual Studio Code - URL Handler" -> "Visual Studio Code",
+/// "Claude Code URL Handler" -> "Claude Code".
+fn strip_handler_suffix(name: &str) -> String {
+    const SUFFIX: &str = "url handler";
+    let trimmed = name.trim_end();
+    let cut = trimmed.len().saturating_sub(SUFFIX.len());
+    if trimmed.is_char_boundary(cut) && trimmed[cut..].eq_ignore_ascii_case(SUFFIX) {
+        let base = trimmed[..cut].trim_end().trim_end_matches('-').trim_end();
+        if !base.is_empty() {
+            return base.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn parse_desktop(text: &str) -> Option<DesktopEntry> {
     let mut in_main = false;
     let (mut name, mut exec, mut wm, mut fp) = (None, None, None, None);
+    let (mut no_display, mut hidden) = (false, false);
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -221,6 +268,8 @@ fn parse_desktop(text: &str) -> Option<DesktopEntry> {
                 "Exec" => exec = Some(v.trim().to_string()),
                 "StartupWMClass" => wm = Some(v.trim().to_string()),
                 "X-Flatpak" => fp = Some(v.trim().to_string()),
+                "NoDisplay" => no_display = v.trim().eq_ignore_ascii_case("true"),
+                "Hidden" => hidden = v.trim().eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
@@ -232,6 +281,8 @@ fn parse_desktop(text: &str) -> Option<DesktopEntry> {
         program,
         flatpak_id: fp,
         wm_class: wm,
+        no_display,
+        hidden,
     })
 }
 
@@ -539,11 +590,10 @@ mod tests {
 
     #[test]
     fn index_lookup_by_basename() {
-        let mut idx = DesktopIndex::default();
-        idx.add(
+        let idx = DesktopIndex::from_files([(
             "org.telegram.desktop",
             "[Desktop Entry]\nName=Telegram Desktop\nExec=telegram-desktop -- %u\n",
-        );
+        )]);
         assert_eq!(
             idx.name_for_exe("/opt/telegram/telegram-desktop")
                 .map(String::as_str),
@@ -553,6 +603,74 @@ mod tests {
             idx.by_id.get("org.telegram.desktop").map(String::as_str),
             Some("Telegram Desktop")
         );
+    }
+
+    const VSCODE: (&str, &str) = (
+        "code",
+        "[Desktop Entry]\nName=Visual Studio Code\nExec=/usr/share/code/code %F\n\n[Desktop Action new-empty-window]\nName=New Empty Window\nExec=/usr/share/code/code --new-window %F\n",
+    );
+    const VSCODE_HANDLER: (&str, &str) = (
+        "code-url-handler",
+        "[Desktop Entry]\nName=Visual Studio Code - URL Handler\nExec=/usr/share/code/code --open-url %U\nNoDisplay=true\n",
+    );
+
+    #[test]
+    fn main_entry_beats_url_handler_in_either_order() {
+        for files in [[VSCODE, VSCODE_HANDLER], [VSCODE_HANDLER, VSCODE]] {
+            let idx = DesktopIndex::from_files(files);
+            assert_eq!(
+                idx.name_for_exe("/usr/share/code/code").map(String::as_str),
+                Some("Visual Studio Code")
+            );
+        }
+    }
+
+    #[test]
+    fn handler_only_app_gets_cleaned_name() {
+        let idx = DesktopIndex::from_files([(
+            "claude-code-url-handler",
+            "[Desktop Entry]\nName=Claude Code URL Handler\nExec=\"/home/a/.nvm/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" --handle-uri %u\nNoDisplay=true\n",
+        )]);
+        assert_eq!(
+            idx.name_for_exe(
+                "/home/a/.nvm/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+            )
+            .map(String::as_str),
+            Some("Claude Code")
+        );
+    }
+
+    #[test]
+    fn handler_suffix_stripping() {
+        assert_eq!(
+            strip_handler_suffix("Visual Studio Code - URL Handler"),
+            "Visual Studio Code"
+        );
+        assert_eq!(
+            strip_handler_suffix("Claude Code URL Handler"),
+            "Claude Code"
+        );
+        assert_eq!(strip_handler_suffix("Devin - Url Handler "), "Devin");
+        assert_eq!(strip_handler_suffix("Firefox"), "Firefox");
+        assert_eq!(strip_handler_suffix("URL Handler"), "URL Handler");
+    }
+
+    #[test]
+    fn builtin_names_for_cli_tools() {
+        let resolver = AppResolver {
+            index: DesktopIndex::default(),
+            built_at: Instant::now(),
+            cache: HashMap::new(),
+        };
+        for (exe, want) in [
+            ("/home/a/bin/claude.exe", "Claude Code"),
+            ("/usr/local/bin/claude", "Claude Code"),
+            ("/usr/share/code/code", "Visual Studio Code"),
+            ("/usr/bin/node", "Node.js"),
+        ] {
+            let info = resolver.name(&Identity::Exe(exe.into()), Some(exe.into()));
+            assert_eq!(info.name, want, "{exe}");
+        }
     }
 
     #[test]

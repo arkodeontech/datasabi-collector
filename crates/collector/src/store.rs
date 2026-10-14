@@ -502,6 +502,24 @@ mod tests {
     }
 
     #[test]
+    fn upsert_app_refreshes_stored_name() {
+        let (_d, s) = store();
+        let key = "/usr/share/code/code";
+        let id = s
+            .upsert_app(key, "Visual Studio Code - URL Handler", None, 0)
+            .unwrap();
+        assert_eq!(
+            s.upsert_app(key, "Visual Studio Code", None, 1).unwrap(),
+            id
+        );
+        let name: String = s
+            .conn
+            .query_row("SELECT name FROM apps WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Visual Studio Code");
+    }
+
+    #[test]
     fn usage_is_summed_and_summarised() {
         let (_d, mut s) = store();
         let now = Local::now();
