@@ -93,6 +93,7 @@ const BUILTIN_NAMES: &[(&str, &str)] = &[
     ("claude.exe", "Claude Code"),
     ("code", "Visual Studio Code"),
     ("node", "Node.js"),
+    ("gh", "GitHub CLI"),
 ];
 
 #[derive(Debug, Default)]
@@ -667,6 +668,7 @@ mod tests {
             ("/usr/local/bin/claude", "Claude Code"),
             ("/usr/share/code/code", "Visual Studio Code"),
             ("/usr/bin/node", "Node.js"),
+            ("/usr/bin/gh", "GitHub CLI"),
         ] {
             let info = resolver.name(&Identity::Exe(exe.into()), Some(exe.into()));
             assert_eq!(info.name, want, "{exe}");
