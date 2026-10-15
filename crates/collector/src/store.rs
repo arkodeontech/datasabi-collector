@@ -11,6 +11,10 @@ use datasabi_protocol::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// Longest alert window accepted (24 hours); the alert engine keeps per-minute
+/// history for the longest rule.
+pub const MAX_ALERT_WINDOW_MINUTES: u32 = 1440;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS apps (
     id          INTEGER PRIMARY KEY,
@@ -155,6 +159,14 @@ impl Store {
 
     /// Upsert a rule keyed by `window_minutes`. Returns the row id.
     pub fn set_alert_rule(&self, window_minutes: u32, threshold_bytes: u64) -> Result<i64> {
+        if !(1..=MAX_ALERT_WINDOW_MINUTES).contains(&window_minutes) {
+            anyhow::bail!(
+                "alert window must be between 1 and {MAX_ALERT_WINDOW_MINUTES} minutes, got {window_minutes}"
+            );
+        }
+        if threshold_bytes == 0 {
+            anyhow::bail!("alert threshold must be more than 0 bytes");
+        }
         let id = self.conn.query_row(
             "INSERT INTO alert_rules (window_minutes, threshold_bytes) VALUES (?1, ?2)
              ON CONFLICT(window_minutes) DO UPDATE SET threshold_bytes = excluded.threshold_bytes
@@ -508,6 +520,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("t.db")).unwrap();
         (dir, s)
+    }
+
+    #[test]
+    fn invalid_alert_rules_are_rejected() {
+        let (_d, s) = store();
+        assert!(s.set_alert_rule(0, 50 * 1024 * 1024).is_err());
+        assert!(s
+            .set_alert_rule(MAX_ALERT_WINDOW_MINUTES + 1, 50 * 1024 * 1024)
+            .is_err());
+        assert!(s.set_alert_rule(15, 0).is_err());
+        assert!(s.set_alert_rule(MAX_ALERT_WINDOW_MINUTES, 1).is_ok());
     }
 
     #[test]
