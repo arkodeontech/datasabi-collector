@@ -388,7 +388,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, interface, name, detected, user_override, last_seen FROM networks ORDER BY last_seen DESC",
         )?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map([], |r| {
                 let name: String = r.get(2)?;
                 let detected = metered_from_str(&r.get::<_, String>(3)?);
@@ -405,6 +405,15 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Rows are newest first. An interface is on one network at a time, so only
+        // its most recent row can be active; an older row seen moments ago (e.g. the
+        // same connection before it was renamed) is not.
+        let mut seen_interfaces = std::collections::HashSet::new();
+        for n in &mut rows {
+            if !seen_interfaces.insert(n.interface.clone()) {
+                n.active = false;
+            }
+        }
         Ok(rows)
     }
 
@@ -499,6 +508,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("t.db")).unwrap();
         (dir, s)
+    }
+
+    #[test]
+    fn only_latest_network_per_interface_is_active() {
+        let (_d, s) = store();
+        s.upsert_network("wlan0", Some("Old name"), Metered::Yes, 100)
+            .unwrap();
+        s.upsert_network("eth0", Some("Office"), Metered::No, 150)
+            .unwrap();
+        s.upsert_network("wlan0", Some("MiFi"), Metered::Yes, 200)
+            .unwrap();
+        let active: Vec<(String, bool)> = s
+            .networks(250)
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name.unwrap(), n.active))
+            .collect();
+        assert_eq!(
+            active,
+            vec![
+                ("MiFi".to_string(), true),
+                ("Office".to_string(), true),
+                ("Old name".to_string(), false),
+            ]
+        );
     }
 
     #[test]
