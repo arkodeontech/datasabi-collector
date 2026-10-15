@@ -32,8 +32,8 @@ Without NetworkManager, every network is "unknown" and therefore treated as mete
 From a release package:
 
 ```sh
-sudo apt install ./datasabi-collector_0.1.0-1_amd64.deb      # Debian, Ubuntu, Mint, Pop!_OS
-sudo dnf install ./datasabi-collector-0.1.0-1.x86_64.rpm      # Fedora, RHEL family
+sudo apt install ./datasabi-collector_*_amd64.deb       # Debian, Ubuntu, Mint, Pop!_OS
+sudo dnf install ./datasabi-collector-*.x86_64.rpm      # Fedora, RHEL family
 ```
 
 The package:
