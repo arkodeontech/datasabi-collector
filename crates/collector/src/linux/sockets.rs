@@ -254,7 +254,8 @@ mod live_tests {
         assert_eq!(t.find(Proto::Tcp, local, peer), None);
         assert!(t.refresh_if_older(MISS_REFRESH_GAP));
         assert_eq!(t.find(Proto::Tcp, local, peer), Some(std::process::id()));
-        // A fresh refresh is not repeated inside the gap.
-        assert!(!t.refresh_if_older(MISS_REFRESH_GAP));
+        // A fresh refresh is not repeated inside the gap. Use a long gap: on a busy
+        // machine the /proc scan alone can take longer than MISS_REFRESH_GAP.
+        assert!(!t.refresh_if_older(Duration::from_secs(60)));
     }
 }
