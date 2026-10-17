@@ -26,7 +26,8 @@ const RESCAN: Duration = Duration::from_secs(5);
 
 /// Virtual interfaces whose traffic is also seen on a physical one (counting both
 /// would double usage). VPN tunnels are skipped too: their traffic is counted on
-/// the physical interface and attributed to the VPN client.
+/// the physical interface (with that network's metered setting) and attributed to
+/// the VPN client. Tunnels with other names are caught by [`is_vpn_tunnel`].
 const SKIP_PREFIXES: &[&str] = &[
     "lo",
     "any",
@@ -52,6 +53,17 @@ const SKIP_PREFIXES: &[&str] = &[
     "cni",
     "flannel",
     "podman",
+    // VPN apps that name their own interfaces (Proton's tunnel and kill switch,
+    // NordVPN, Mullvad, PIA, Cisco AnyConnect, GlobalProtect).
+    "proton",
+    "pvpn",
+    "ipv6leak",
+    "nordlynx",
+    "nordtun",
+    "mullvad",
+    "wgpia",
+    "cscotun",
+    "gpd",
 ];
 
 pub fn eligible(dev: &Device, filter: &[String]) -> bool {
@@ -61,6 +73,53 @@ pub fn eligible(dev: &Device, filter: &[String]) -> bool {
     !dev.flags.is_loopback()
         && dev.flags.is_up()
         && !SKIP_PREFIXES.iter().any(|p| dev.name.starts_with(p))
+        && !is_vpn_tunnel(&LinkInfo::read(&dev.name))
+}
+
+/// `ARPHRD_NONE`: layer-3 links without a hardware header (WireGuard, tun).
+const ARPHRD_NONE: u32 = 65534;
+
+/// What sysfs says about an interface, enough to tell a VPN tunnel apart.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LinkInfo {
+    /// `/sys/class/net/<if>/type` (ARPHRD_*).
+    pub link_type: Option<u32>,
+    /// `DEVTYPE=` from `uevent` (e.g. "wireguard", "wlan").
+    pub devtype: Option<String>,
+    /// `tun_flags` exists: a tun/tap device (OpenVPN and most VPN apps).
+    pub tun: bool,
+    /// Backed by hardware (`device` link exists): Wi-Fi, Ethernet, USB modems.
+    pub physical: bool,
+}
+
+impl LinkInfo {
+    pub fn read(iface: &str) -> Self {
+        let dir = std::path::Path::new("/sys/class/net").join(iface);
+        let devtype = std::fs::read_to_string(dir.join("uevent"))
+            .ok()
+            .and_then(|u| {
+                u.lines()
+                    .find_map(|l| l.strip_prefix("DEVTYPE=").map(str::to_string))
+            });
+        Self {
+            link_type: std::fs::read_to_string(dir.join("type"))
+                .ok()
+                .and_then(|t| t.trim().parse().ok()),
+            devtype,
+            tun: dir.join("tun_flags").exists(),
+            physical: dir.join("device").exists(),
+        }
+    }
+}
+
+/// A VPN tunnel whatever its name: a virtual tun/tap device, a WireGuard link, or
+/// another headerless layer-3 link. Hardware never counts: a USB modem in raw-IP
+/// mode is also `ARPHRD_NONE` but carries the real (often metered) traffic.
+pub fn is_vpn_tunnel(link: &LinkInfo) -> bool {
+    if link.physical {
+        return false;
+    }
+    link.tun || link.devtype.as_deref() == Some("wireguard") || link.link_type == Some(ARPHRD_NONE)
 }
 
 pub fn spawn_manager(filter: Vec<String>, tx: SyncSender<Msg>, shutdown: Arc<AtomicBool>) {
@@ -173,4 +232,61 @@ fn capture_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(link_type: u32, devtype: Option<&str>, tun: bool, physical: bool) -> LinkInfo {
+        LinkInfo {
+            link_type: Some(link_type),
+            devtype: devtype.map(str::to_string),
+            tun,
+            physical,
+        }
+    }
+
+    #[test]
+    fn vpn_tunnels_are_skipped_whatever_their_name() {
+        // ProtonVPN / NordVPN (kernel WireGuard): headerless, virtual.
+        assert!(is_vpn_tunnel(&link(65534, Some("wireguard"), false, false)));
+        // OpenVPN tun (layer 3) and tap (layer 2, Ethernet type).
+        assert!(is_vpn_tunnel(&link(65534, None, true, false)));
+        assert!(is_vpn_tunnel(&link(1, None, true, false)));
+    }
+
+    #[test]
+    fn real_networks_are_kept() {
+        // Wi-Fi and Ethernet.
+        assert!(!is_vpn_tunnel(&link(1, Some("wlan"), false, true)));
+        assert!(!is_vpn_tunnel(&link(1, None, false, true)));
+        // USB modem in raw-IP mode: also ARPHRD_NONE, but hardware — must be counted.
+        assert!(!is_vpn_tunnel(&link(65534, Some("wwan"), false, true)));
+        // PPP mobile modem (ARPHRD_PPP).
+        assert!(!is_vpn_tunnel(&link(512, None, false, false)));
+    }
+
+    #[test]
+    fn named_vpn_interfaces_are_on_the_skip_list() {
+        for name in [
+            "proton0",
+            "ipv6leakintrf0",
+            "pvpn-ks",
+            "nordlynx",
+            "tun0",
+            "wg0",
+        ] {
+            assert!(
+                SKIP_PREFIXES.iter().any(|p| name.starts_with(p)),
+                "{name} should be skipped"
+            );
+        }
+        for name in ["wlp2s0", "enp3s0", "usb0", "wwan0", "ppp0"] {
+            assert!(
+                !SKIP_PREFIXES.iter().any(|p| name.starts_with(p)),
+                "{name} must be captured"
+            );
+        }
+    }
 }
