@@ -11,6 +11,13 @@ use datasabi_protocol::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// Longest alert window accepted (24 hours); the alert engine keeps per-minute
+/// history for the longest rule.
+pub const MAX_ALERT_WINDOW_MINUTES: u32 = 1440;
+/// Smallest alert threshold: 1 MB in the app's decimal units (1 000 000 bytes),
+/// so both of the app's unit settings (1024 or 1000 MB per GB) can set it.
+pub const MIN_ALERT_THRESHOLD_BYTES: u64 = 1_000_000;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS apps (
     id          INTEGER PRIMARY KEY,
@@ -154,7 +161,18 @@ impl Store {
     }
 
     /// Upsert a rule keyed by `window_minutes`. Returns the row id.
+    ///
+    /// An existing window is updated, not refused: that is how a rule is edited.
+    /// The app refuses a *new* rule for a window that already has one.
     pub fn set_alert_rule(&self, window_minutes: u32, threshold_bytes: u64) -> Result<i64> {
+        if !(1..=MAX_ALERT_WINDOW_MINUTES).contains(&window_minutes) {
+            anyhow::bail!(
+                "alert window must be between 1 and {MAX_ALERT_WINDOW_MINUTES} minutes, got {window_minutes}"
+            );
+        }
+        if threshold_bytes < MIN_ALERT_THRESHOLD_BYTES {
+            anyhow::bail!("alert threshold must be at least 1 MB, got {threshold_bytes} bytes");
+        }
         let id = self.conn.query_row(
             "INSERT INTO alert_rules (window_minutes, threshold_bytes) VALUES (?1, ?2)
              ON CONFLICT(window_minutes) DO UPDATE SET threshold_bytes = excluded.threshold_bytes
@@ -508,6 +526,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("t.db")).unwrap();
         (dir, s)
+    }
+
+    #[test]
+    fn invalid_alert_rules_are_rejected() {
+        let (_d, s) = store();
+        let mb = 1024 * 1024;
+        assert!(s.set_alert_rule(0, 50 * mb).is_err());
+        assert!(s
+            .set_alert_rule(MAX_ALERT_WINDOW_MINUTES + 1, 50 * mb)
+            .is_err());
+        assert!(s.set_alert_rule(15, 0).is_err());
+        assert!(s.set_alert_rule(15, MIN_ALERT_THRESHOLD_BYTES - 1).is_err());
+        assert!(s
+            .set_alert_rule(MAX_ALERT_WINDOW_MINUTES, MIN_ALERT_THRESHOLD_BYTES)
+            .is_ok());
+        assert!(s.set_alert_rule(1, mb).is_ok());
+    }
+
+    #[test]
+    fn editing_a_rule_updates_its_window() {
+        let (_d, s) = store();
+        // 30 min isn't one of the default rules the store starts with.
+        let id = s.set_alert_rule(30, 50 * 1024 * 1024).unwrap();
+        let again = s.set_alert_rule(30, 80 * 1024 * 1024).unwrap();
+        assert_eq!(id, again);
+        let rules: Vec<_> = s
+            .get_alert_rules()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.window_minutes == 30)
+            .collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].threshold_bytes, 80 * 1024 * 1024);
     }
 
     #[test]
