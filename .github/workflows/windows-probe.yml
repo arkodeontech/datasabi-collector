@@ -1,0 +1,42 @@
+name: Windows probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/windows-probe/**"
+      - ".github/workflows/windows-probe.yml"
+  pull_request:
+    paths:
+      - "tools/windows-probe/**"
+      - ".github/workflows/windows-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-probe:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tools/windows-probe
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/windows-probe
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: datasabi-probe
+          path: tools/windows-probe/target/release/datasabi-probe.exe

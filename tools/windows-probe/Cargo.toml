@@ -1,0 +1,19 @@
+[package]
+name = "datasabi-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Windows test program: counts data per app from ETW and compares it with adapter totals"
+publish = false
+
+# Kept out of the collector workspace: it only builds on Windows, in its own CI job.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+ferrisetw = "1.2"
+
+[profile.release]
+strip = true
