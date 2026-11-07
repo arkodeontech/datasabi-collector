@@ -21,6 +21,15 @@ Addresses are only looked at in memory, to skip loopback and local-network traff
 3. Run `.\datasabi-probe.exe`, or `.\datasabi-probe.exe --minutes 30` for a shorter run.
 4. Press Enter to stop early. The report is saved as `datasabi-probe-<number>.csv` in the same folder.
 
-The program isn't signed, so Windows may warn before it runs.
+The program isn't signed, so Windows may warn before it runs. If Windows blocks it, run `Unblock-File .\datasabi-probe.exe` first.
+
+## Measured runs
+
+- **Only this computer on the MiFi or hotspot.** Disconnect every other device (phones, other laptops, TVs), and keep only one connection active on the computer (no cable or second Wi-Fi). Don't switch networks during a run; start a new run for each connection.
+- **Download a file of known size,** 200 MB is enough (500 MB is optional), and click Check for updates in Windows Update.
+- **Note the data used before and after,** from as many of these as you have:
+  - the MiFi's own usage counter on its admin page (often 192.168.0.1 or 192.168.8.1)
+  - the balance in the network's app or by USSD; read it about 10 minutes after the run ends, because it updates late and is rounded
+  - on a phone hotspot: the phone's hotspot usage figure (on Android, usually Settings, then Data usage, then Hotspot), not the balance, because the phone's own apps use the same data
 
 The program clears a session left by a crashed run before it starts. If the trace still won't start, run `logman stop DataSabiProbe -ets` and try again.
