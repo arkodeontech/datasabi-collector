@@ -7,7 +7,7 @@ The DataSabi desktop app talks to this service over a local socket. The collecto
 | | |
 |---|---|
 | Platforms | Linux (now), Windows (planned, using ETW) |
-| License | Apache-2.0 |
+| License | GPL-3.0 (collector), Apache-2.0 (protocol crate) |
 | Language | Rust |
 
 ## What it does
@@ -136,10 +136,15 @@ See [`crates/protocol/src/lib.rs`](crates/protocol/src/lib.rs) for every message
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
-Copyright 2026 Arkodeon Technologies Ltd.
+- **Collector service and `dsctl`** (`crates/collector`): GNU General Public License, version 3 only. See [LICENSE](LICENSE). You may use, change and share it, but copies and changed versions you share must stay under GPL-3.0, with their source code.
+- **Protocol crate** (`crates/protocol`): Apache License 2.0. See [crates/protocol/LICENSE](crates/protocol/LICENSE). Apps of any licence can use the message types to talk to the collector.
+- **Version 0.1.6 and earlier** were released under Apache-2.0 and stay available under it.
+
+See [NOTICE](NOTICE). Copyright 2026 Arkodeon Technologies Ltd.
 
 ## Contributing
+
+Pull requests from outside Arkodeon need a signed contributor agreement before they can be merged. Arkodeon will send it to you; open an issue first to ask.
 
 After cloning, activate the git hooks (pre-commit checks `cargo fmt` + `cargo clippy`; commit-msg enforces [Conventional Commits](https://www.conventionalcommits.org)):
 

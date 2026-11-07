@@ -53,6 +53,8 @@ assets = [
     ["target/release/dsctl", "usr/bin/", "755"],
     ["../../packaging/linux/datasabi-collector.service", "usr/lib/systemd/system/", "644"],
     ["../../README.md", "usr/share/doc/datasabi-collector/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/datasabi-collector/LICENSE", "644"],
+    ["../../NOTICE", "usr/share/doc/datasabi-collector/NOTICE", "644"],
 ]
 
 # `cargo generate-rpm -p crates/collector` (cargo install cargo-generate-rpm)
@@ -65,6 +67,8 @@ assets = [
     { source = "target/release/datasabi-collector", dest = "/usr/lib/datasabi/datasabi-collector", mode = "755" },
     { source = "target/release/dsctl", dest = "/usr/bin/dsctl", mode = "755" },
     { source = "packaging/linux/datasabi-collector.service", dest = "/usr/lib/systemd/system/datasabi-collector.service", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/datasabi-collector/LICENSE", mode = "644", doc = true },
+    { source = "NOTICE", dest = "/usr/share/doc/datasabi-collector/NOTICE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]

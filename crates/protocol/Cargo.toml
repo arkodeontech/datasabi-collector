@@ -3,7 +3,8 @@ name = "datasabi-protocol"
 description = "IPC message types shared by the DataSabi collector and desktop app"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Apache-2.0, so apps of any licence can use the message types.
+license = "Apache-2.0"
 authors.workspace = true
 repository.workspace = true
 
