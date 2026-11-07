@@ -693,7 +693,12 @@ mod tests {
     #[test]
     fn rollup_moves_data_across_tiers() {
         let (_d, mut s) = store();
-        let now = Local::now();
+        // A fixed mid-month date, so the row 10 days earlier is always in the same month.
+        // With today's date the test failed before the 11th of every month.
+        let now = Local
+            .with_ymd_and_hms(2026, 10, 25, 12, 0, 0)
+            .single()
+            .expect("valid local time");
         // Write a minute row 10 days ago (older than 7-day minute retention).
         let old_ts = now.timestamp() - 10 * 86_400;
         let old_minute = old_ts - old_ts.rem_euclid(60);
