@@ -144,6 +144,8 @@ See [NOTICE](NOTICE). Copyright 2026 Arkodeon Technologies Ltd.
 
 ## Contributing
 
+Pull requests from outside Arkodeon need a signed contributor agreement before they can be merged. Arkodeon will send it to you; open an issue first to ask.
+
 After cloning, activate the git hooks (pre-commit checks `cargo fmt` + `cargo clippy`; commit-msg enforces [Conventional Commits](https://www.conventionalcommits.org)):
 
 ```sh
