@@ -12,6 +12,9 @@ on:
       - ".github/workflows/windows-probe.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -31,6 +34,7 @@ jobs:
           workspaces: tools/windows-probe
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
       - run: cargo build --release
       - uses: actions/upload-artifact@v7
         with:

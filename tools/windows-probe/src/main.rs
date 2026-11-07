@@ -1,13 +1,15 @@
 //! datasabi-probe: a test program for the DataSabi Windows plan.
 //!
 //! It counts how many bytes each process sends and receives, using the ETW provider
-//! `Microsoft-Windows-Kernel-Network`, and compares the total with the network
-//! adapters' own byte counters. Processes inside `svchost.exe` are labelled with the
-//! services they host, to see whether Windows Update can be told apart from "System".
+//! `Microsoft-Windows-Kernel-Network`, and compares the total with the byte and packet
+//! counters of the network adapter that carries the internet connection. Processes
+//! inside `svchost.exe` are labelled with the services they host, to see whether
+//! Windows Update can be told apart from "System".
 //!
 //! Privacy: addresses are only looked at in memory, to skip loopback and local-network
-//! traffic. Nothing about packet contents, addresses or websites is printed or saved.
-//! The report holds process names, service names and byte counts only.
+//! traffic. Nothing about packet contents, addresses, websites or the network's name is
+//! printed or saved. The report holds process names, service names, adapter names and
+//! counts only.
 
 #[cfg(not(windows))]
 fn main() {
@@ -26,6 +28,103 @@ fn main() {
     }
 }
 
+/// Small helpers with no Windows dependency, so they can be unit-tested.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod parse {
+    use std::net::IpAddr;
+
+    /// Loopback, private, link-local or unspecified: traffic that never uses the bundle
+    /// when both ends are like this.
+    pub fn is_local(ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            }
+            IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80
+            }
+        }
+    }
+
+    /// Splits one CSV line with double-quoted fields.
+    pub fn csv_fields(line: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        let mut chars = line.trim_end_matches(['\r', '\n']).chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields.push(std::mem::take(&mut cur)),
+                _ => cur.push(ch),
+            }
+        }
+        fields.push(cur);
+        fields
+    }
+
+    /// Lines of `logman query <name> -ets` that report lost events or buffers, as
+    /// (label, value) pairs, for example ("Events Lost", "0").
+    pub fn lost_lines(logman_output: &str) -> Vec<(String, String)> {
+        logman_output
+            .lines()
+            .filter_map(|line| {
+                let (label, value) = line.split_once(':')?;
+                let label = label.trim();
+                if label.to_ascii_lowercase().contains("lost") {
+                    Some((label.to_string(), value.trim().to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn local_addresses() {
+            for local in ["127.0.0.1", "192.168.8.1", "10.0.0.5", "169.254.1.1", "::1"] {
+                assert!(is_local(&local.parse().unwrap()), "{local}");
+            }
+            for local in ["fe80::1", "fd00::1"] {
+                assert!(is_local(&local.parse().unwrap()), "{local}");
+            }
+            for public in ["8.8.8.8", "102.89.0.1", "2001:4860:4860::8888"] {
+                assert!(!is_local(&public.parse().unwrap()), "{public}");
+            }
+        }
+
+        #[test]
+        fn csv_quoted_fields() {
+            assert_eq!(
+                csv_fields("\"svchost.exe\",\"1234\",\"wuauserv,BITS\"\r"),
+                vec!["svchost.exe", "1234", "wuauserv,BITS"]
+            );
+            assert_eq!(csv_fields("\"a \"\"b\"\"\",1,"), vec!["a \"b\"", "1", ""]);
+        }
+
+        #[test]
+        fn logman_lost_lines() {
+            let out = "Name:                 DataSabiProbe\r\nEvents Lost:          3\r\nBuffers Written:      10\r\n";
+            assert_eq!(
+                lost_lines(out),
+                vec![("Events Lost".to_string(), "3".to_string())]
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 mod probe {
     use std::collections::HashMap;
@@ -40,8 +139,10 @@ mod probe {
     use ferrisetw::parser::Parser;
     use ferrisetw::provider::Provider;
     use ferrisetw::schema_locator::SchemaLocator;
-    use ferrisetw::trace::UserTrace;
+    use ferrisetw::trace::{TraceTrait, UserTrace};
     use ferrisetw::EventRecord;
+
+    use crate::parse::{csv_fields, is_local, lost_lines};
 
     /// Microsoft-Windows-Kernel-Network.
     const KERNEL_NETWORK: &str = "7DD42A49-5329-4832-8DFD-43D979153A88";
@@ -75,6 +176,28 @@ mod probe {
                 tx: self.tx.saturating_sub(start.tx),
             }
         }
+        fn plus(&self, other: &Bytes) -> Bytes {
+            Bytes {
+                rx: self.rx + other.rx,
+                tx: self.tx + other.tx,
+            }
+        }
+    }
+
+    /// One adapter's counters: bytes and packets (whole packets, headers included).
+    #[derive(Default, Clone, Copy)]
+    struct Adapter {
+        bytes: Bytes,
+        packets: Bytes,
+    }
+
+    impl Adapter {
+        fn since(&self, start: &Adapter) -> Adapter {
+            Adapter {
+                bytes: self.bytes.since(&start.bytes),
+                packets: self.packets.since(&start.packets),
+            }
+        }
     }
 
     #[derive(Default)]
@@ -100,15 +223,24 @@ mod probe {
         let minutes = parse_minutes()?;
         println!("DataSabi Windows probe");
         println!("Counts data per app for {minutes} minutes, or until you press Enter.");
-        println!("Nothing about websites, addresses or packet contents is saved.");
+        println!(
+            "Nothing about websites, addresses, packet contents or the network's name is saved."
+        );
         println!();
 
-        let (net_name, net_cost) = network_profile();
-        println!("Network: {net_name} (Windows cost setting: {net_cost})");
+        let (net_cost, internet_adapter) = network_profile();
+        println!("Windows cost setting for this network: {net_cost}");
+        match &internet_adapter {
+            Some(name) => println!("Adapter carrying the internet connection: {name}"),
+            None => println!("Could not tell which adapter carries the internet connection; totals use all adapters."),
+        }
 
         let adapters_start = adapter_totals().context("could not read adapter totals")?;
         let names: Arc<Mutex<HashMap<u32, ProcInfo>>> = Arc::new(Mutex::new(HashMap::new()));
         refresh_names(&names);
+
+        // A session left behind by a crashed run would stop this one from starting.
+        let _ = command_text("logman", &["stop", TRACE_NAME, "-ets"]);
 
         let counters = Arc::new(Mutex::new(Counters::default()));
         let cb_counters = counters.clone();
@@ -126,7 +258,7 @@ mod probe {
             .map_err(|e| {
                 anyhow::anyhow!(
                     "could not start the ETW trace ({e:?}). Run PowerShell as Administrator. \
-                     If a previous run crashed, run `logman stop {TRACE_NAME} -ets` and try again."
+                     If it still fails, run `logman stop {TRACE_NAME} -ets` and try again."
                 )
             })?;
 
@@ -162,28 +294,55 @@ mod probe {
             }
             if now >= next_report {
                 let adapters = adapter_totals().unwrap_or_default();
-                print_progress(started, &counters, &names, &adapters_start, &adapters);
+                print_progress(
+                    started,
+                    &counters,
+                    &names,
+                    internet_adapter.as_deref(),
+                    &adapters_start,
+                    &adapters,
+                );
                 next_report = now + REPORT_EVERY;
             }
         }
 
         refresh_names(&names);
         let adapters_end = adapter_totals().context("could not read adapter totals")?;
+        // Read the session's lost-event counters while it is still running.
+        let lost = lost_lines(&command_text("logman", &["query", TRACE_NAME, "-ets"]));
+        let handled = trace.events_handled();
         let _ = trace.stop();
         let elapsed = started.elapsed();
-        print_progress(started, &counters, &names, &adapters_start, &adapters_end);
-        let path = write_report(
-            elapsed,
-            &net_cost,
+        print_progress(
+            started,
             &counters,
             &names,
+            internet_adapter.as_deref(),
             &adapters_start,
             &adapters_end,
-        )?;
+        );
+        if lost.is_empty() {
+            println!("Lost events: unknown (logman gave no figure)");
+        }
+        for (label, value) in &lost {
+            println!("{label}: {value}");
+        }
+        let path = write_report(&Report {
+            elapsed,
+            net_cost: &net_cost,
+            internet_adapter: internet_adapter.as_deref(),
+            counters: &counters,
+            names: &names,
+            adapters_start: &adapters_start,
+            adapters_end: &adapters_end,
+            handled,
+            lost: &lost,
+        })?;
         println!();
         println!("Report saved: {}", path.display());
-        println!("Send it to Claude with the balance before and after, and a screenshot of");
-        println!("Settings > Network & internet > Advanced network settings > Data usage.");
+        println!("Send the report to whoever asked you to run this test, with your data balance");
+        println!("before and after, and a screenshot of Settings > Network & internet >");
+        println!("Advanced network settings > Data usage.");
         println!("Press Enter to close.");
         let _ = std::io::stdin().read_line(&mut String::new());
         Ok(())
@@ -243,23 +402,6 @@ mod probe {
             .add(outgoing, u64::from(size));
     }
 
-    /// Loopback, private, link-local or unspecified: traffic that never uses the bundle
-    /// when both ends are like this.
-    fn is_local(ip: &IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            IpAddr::V6(v6) => {
-                let first = v6.segments()[0];
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80
-            }
-        }
-    }
-
     /// Runs a command and returns its output as text, or an empty string on failure.
     fn command_text(program: &str, args: &[&str]) -> String {
         Command::new(program)
@@ -276,33 +418,52 @@ mod probe {
         )
     }
 
-    /// The internet connection's profile name and Windows' cost setting for it.
-    fn network_profile() -> (String, String) {
+    /// Windows' cost setting for the internet connection, and the name of the adapter
+    /// that carries it. The network's own name (the Wi-Fi name) is not read.
+    fn network_profile() -> (String, Option<String>) {
         let script = "$p=[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile(); \
-                      if ($p) { $c=$p.GetConnectionCost(); Write-Output \"$($p.ProfileName)|$($c.NetworkCostType)\" }";
+                      $cost = if ($p) { $p.GetConnectionCost().NetworkCostType } else { 'unknown' }; \
+                      $alias = (Get-NetConnectionProfile | Where-Object { $_.IPv4Connectivity -eq 'Internet' -or $_.IPv6Connectivity -eq 'Internet' } | Select-Object -First 1).InterfaceAlias; \
+                      Write-Output \"$cost|$alias\"";
         let out = powershell(script);
         let line = out.lines().next().unwrap_or("").trim();
         match line.split_once('|') {
-            Some((name, cost)) => (name.to_string(), cost.to_string()),
-            None => ("unknown".to_string(), "unknown".to_string()),
+            Some((cost, alias)) => {
+                let alias = alias.trim();
+                let cost = if cost.is_empty() { "unknown" } else { cost };
+                (
+                    cost.to_string(),
+                    (!alias.is_empty()).then(|| alias.to_string()),
+                )
+            }
+            None => ("unknown".to_string(), None),
         }
     }
 
-    /// Bytes received and sent per network adapter since it started.
-    fn adapter_totals() -> Result<HashMap<String, Bytes>> {
+    /// Bytes and packets received and sent per network adapter since it started.
+    fn adapter_totals() -> Result<HashMap<String, Adapter>> {
         let out = powershell(
-            "Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes | ConvertTo-Csv -NoTypeInformation",
+            "Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes,\
+             ReceivedUnicastPackets,ReceivedMulticastPackets,ReceivedBroadcastPackets,\
+             SentUnicastPackets,SentMulticastPackets,SentBroadcastPackets | ConvertTo-Csv -NoTypeInformation",
         );
         let mut map = HashMap::new();
         for line in out.lines().skip(1) {
             let f = csv_fields(line);
-            if f.len() < 3 {
+            if f.len() < 9 {
                 continue;
             }
-            let (Ok(rx), Ok(tx)) = (f[1].parse::<u64>(), f[2].parse::<u64>()) else {
-                continue;
-            };
-            map.insert(f[0].clone(), Bytes { rx, tx });
+            let n: Vec<u64> = f[1..9].iter().map(|v| v.parse().unwrap_or(0)).collect();
+            map.insert(
+                f[0].clone(),
+                Adapter {
+                    bytes: Bytes { rx: n[0], tx: n[1] },
+                    packets: Bytes {
+                        rx: n[2] + n[3] + n[4],
+                        tx: n[5] + n[6] + n[7],
+                    },
+                },
+            );
         }
         if map.is_empty() {
             bail!("Get-NetAdapterStatistics returned nothing");
@@ -338,27 +499,6 @@ mod probe {
         }
     }
 
-    /// Splits one CSV line with double-quoted fields.
-    fn csv_fields(line: &str) -> Vec<String> {
-        let mut fields = Vec::new();
-        let mut cur = String::new();
-        let mut quoted = false;
-        let mut chars = line.trim_end_matches(['\r', '\n']).chars().peekable();
-        while let Some(ch) = chars.next() {
-            match ch {
-                '"' if quoted && chars.peek() == Some(&'"') => {
-                    cur.push('"');
-                    chars.next();
-                }
-                '"' => quoted = !quoted,
-                ',' if !quoted => fields.push(std::mem::take(&mut cur)),
-                _ => cur.push(ch),
-            }
-        }
-        fields.push(cur);
-        fields
-    }
-
     /// Groups byte counts by process name, with svchost labelled by its services.
     fn grouped(
         counters: &Mutex<Counters>,
@@ -377,8 +517,7 @@ mod probe {
                 None => (format!("unknown (pid {pid})"), String::new()),
             };
             let entry = groups.entry((image, services)).or_default();
-            entry.rx += b.rx;
-            entry.tx += b.tx;
+            *entry = entry.plus(&b);
         }
         let mut rows: Vec<(String, String, Bytes)> =
             groups.into_iter().map(|((i, s), b)| (i, s, b)).collect();
@@ -386,27 +525,46 @@ mod probe {
         rows
     }
 
-    fn sum_adapters(start: &HashMap<String, Bytes>, now: &HashMap<String, Bytes>) -> Bytes {
-        let mut total = Bytes::default();
-        for (name, b) in now {
-            if let Some(s) = start.get(name) {
-                let d = b.since(s);
-                total.rx += d.rx;
-                total.tx += d.tx;
+    /// Change in every adapter's counters between two readings.
+    fn adapter_deltas(
+        start: &HashMap<String, Adapter>,
+        now: &HashMap<String, Adapter>,
+    ) -> Vec<(String, Adapter)> {
+        let mut names: Vec<&String> = now.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let (a, s) = (now.get(name)?, start.get(name)?);
+                Some((name.clone(), a.since(s)))
+            })
+            .collect()
+    }
+
+    /// The internet adapter's change if known, otherwise all adapters added together.
+    fn baseline(deltas: &[(String, Adapter)], internet_adapter: Option<&str>) -> Adapter {
+        if let Some(name) = internet_adapter {
+            if let Some((_, a)) = deltas.iter().find(|(n, _)| n == name) {
+                return *a;
             }
         }
-        total
+        deltas
+            .iter()
+            .fold(Adapter::default(), |acc, (_, a)| Adapter {
+                bytes: acc.bytes.plus(&a.bytes),
+                packets: acc.packets.plus(&a.packets),
+            })
     }
 
     fn mb(n: u64) -> f64 {
         n as f64 / (1024.0 * 1024.0)
     }
 
-    fn coverage(apps: u64, adapters: u64) -> f64 {
-        if adapters == 0 {
+    fn percent(part: u64, whole: u64) -> f64 {
+        if whole == 0 {
             0.0
         } else {
-            apps as f64 * 100.0 / adapters as f64
+            part as f64 * 100.0 / whole as f64
         }
     }
 
@@ -414,18 +572,20 @@ mod probe {
         started: Instant,
         counters: &Mutex<Counters>,
         names: &Mutex<HashMap<u32, ProcInfo>>,
-        adapters_start: &HashMap<String, Bytes>,
-        adapters_now: &HashMap<String, Bytes>,
+        internet_adapter: Option<&str>,
+        adapters_start: &HashMap<String, Adapter>,
+        adapters_now: &HashMap<String, Adapter>,
     ) {
         let rows = grouped(counters, names);
         let apps: u64 = rows.iter().map(|r| r.2.total()).sum();
-        let adapters = sum_adapters(adapters_start, adapters_now).total();
+        let deltas = adapter_deltas(adapters_start, adapters_now);
+        let adapter = baseline(&deltas, internet_adapter).bytes.total();
         println!(
-            "[{} min] apps {:.1} MB | adapters {:.1} MB | apps / adapters {:.1}%",
+            "[{} min] apps {:.1} MB | adapter {:.1} MB | apps / adapter {:.1}%",
             started.elapsed().as_secs() / 60,
             mb(apps),
-            mb(adapters),
-            coverage(apps, adapters)
+            mb(adapter),
+            percent(apps, adapter)
         );
         for (image, services, b) in rows.iter().take(8) {
             let label = if services.is_empty() {
@@ -438,23 +598,28 @@ mod probe {
         println!();
     }
 
-    fn write_report(
+    struct Report<'a> {
         elapsed: Duration,
-        net_cost: &str,
-        counters: &Mutex<Counters>,
-        names: &Mutex<HashMap<u32, ProcInfo>>,
-        adapters_start: &HashMap<String, Bytes>,
-        adapters_end: &HashMap<String, Bytes>,
-    ) -> Result<std::path::PathBuf> {
-        let rows = grouped(counters, names);
-        let apps = rows.iter().fold(Bytes::default(), |mut acc, r| {
-            acc.rx += r.2.rx;
-            acc.tx += r.2.tx;
-            acc
-        });
-        let adapters = sum_adapters(adapters_start, adapters_end);
+        net_cost: &'a str,
+        internet_adapter: Option<&'a str>,
+        counters: &'a Mutex<Counters>,
+        names: &'a Mutex<HashMap<u32, ProcInfo>>,
+        adapters_start: &'a HashMap<String, Adapter>,
+        adapters_end: &'a HashMap<String, Adapter>,
+        handled: usize,
+        lost: &'a [(String, String)],
+    }
+
+    fn write_report(r: &Report) -> Result<std::path::PathBuf> {
+        let rows = grouped(r.counters, r.names);
+        let apps = rows
+            .iter()
+            .fold(Bytes::default(), |acc, row| acc.plus(&row.2));
+        let deltas = adapter_deltas(r.adapters_start, r.adapters_end);
+        let base = baseline(&deltas, r.internet_adapter);
+        let all = baseline(&deltas, None);
         let (local, events, unparsed, no_address) = {
-            let c = lock(counters);
+            let c = lock(r.counters);
             (c.local, c.events, c.unparsed, c.no_address)
         };
 
@@ -471,64 +636,78 @@ mod probe {
             .with_context(|| format!("could not create {}", path.display()))?;
 
         let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let mut out = String::new();
-        out.push_str("section,name,services,bytes_received,bytes_sent,bytes_total\n");
-        out.push_str(&format!(
-            "summary,minutes,,,,{:.1}\n",
-            elapsed.as_secs_f64() / 60.0
-        ));
-        out.push_str(&format!(
-            "summary,windows_cost_setting,{},,,\n",
-            q(net_cost)
-        ));
-        out.push_str(&format!(
-            "summary,apps_internet,,{},{},{}\n",
-            apps.rx,
-            apps.tx,
-            apps.total()
-        ));
-        out.push_str(&format!(
-            "summary,adapters,,{},{},{}\n",
-            adapters.rx,
-            adapters.tx,
-            adapters.total()
-        ));
-        out.push_str(&format!(
-            "summary,apps_percent_of_adapters,,,,{:.2}\n",
-            coverage(apps.total(), adapters.total())
-        ));
-        out.push_str(&format!(
-            "summary,local_network_skipped,,{},{},{}\n",
-            local.rx,
-            local.tx,
-            local.total()
-        ));
-        out.push_str(&format!("summary,events,,,,{events}\n"));
-        out.push_str(&format!("summary,events_not_parsed,,,,{unparsed}\n"));
-        out.push_str(&format!("summary,events_without_address,,,,{no_address}\n"));
-        let mut adapter_names: Vec<&String> = adapters_end.keys().collect();
-        adapter_names.sort();
-        for name in adapter_names {
-            if let (Some(s), Some(e)) = (adapters_start.get(name), adapters_end.get(name)) {
-                let d = e.since(s);
-                out.push_str(&format!(
-                    "adapter,{},,{},{},{}\n",
+        let row =
+            |section: &str, name: &str, services: &str, b: Option<&Bytes>, p: Option<&Bytes>| {
+                let (brx, btx, btot) = b
+                    .map_or((String::new(), String::new(), String::new()), |b| {
+                        (b.rx.to_string(), b.tx.to_string(), b.total().to_string())
+                    });
+                let (prx, ptx) = p.map_or((String::new(), String::new()), |p| {
+                    (p.rx.to_string(), p.tx.to_string())
+                });
+                format!(
+                    "{section},{},{},{brx},{btx},{btot},{prx},{ptx}\n",
                     q(name),
-                    d.rx,
-                    d.tx,
-                    d.total()
-                ));
-            }
+                    q(services)
+                )
+            };
+        let value = |name: &str, v: String| format!("summary,{},,,,{v},,\n", q(name));
+
+        let mut out = String::from(
+            "section,name,services,bytes_received,bytes_sent,bytes_total,packets_received,packets_sent\n",
+        );
+        out.push_str(&value(
+            "minutes",
+            format!("{:.1}", r.elapsed.as_secs_f64() / 60.0),
+        ));
+        out.push_str(&value("windows_cost_setting", r.net_cost.to_string()));
+        out.push_str(&value(
+            "internet_adapter",
+            r.internet_adapter
+                .unwrap_or("unknown (all adapters used)")
+                .to_string(),
+        ));
+        out.push_str(&row("summary", "apps_internet", "", Some(&apps), None));
+        out.push_str(&row(
+            "summary",
+            "internet_adapter_totals",
+            "",
+            Some(&base.bytes),
+            Some(&base.packets),
+        ));
+        out.push_str(&value(
+            "apps_percent_of_internet_adapter",
+            format!("{:.2}", percent(apps.total(), base.bytes.total())),
+        ));
+        out.push_str(&row(
+            "summary",
+            "all_adapters_totals",
+            "",
+            Some(&all.bytes),
+            Some(&all.packets),
+        ));
+        out.push_str(&row(
+            "summary",
+            "local_network_skipped",
+            "",
+            Some(&local),
+            None,
+        ));
+        out.push_str(&value("events_counted", events.to_string()));
+        out.push_str(&value("events_handled_by_etw", r.handled.to_string()));
+        out.push_str(&value("events_not_parsed", unparsed.to_string()));
+        out.push_str(&value("events_without_address", no_address.to_string()));
+        if r.lost.is_empty() {
+            out.push_str(&value("etw_lost", "unknown".to_string()));
+        }
+        for (label, v) in r.lost {
+            out.push_str(&value(&format!("etw: {label}"), v.clone()));
+        }
+        for (name, a) in &deltas {
+            out.push_str(&row("adapter", name, "", Some(&a.bytes), Some(&a.packets)));
         }
         for (image, services, b) in &rows {
-            out.push_str(&format!(
-                "app,{},{},{},{},{}\n",
-                q(image),
-                q(services),
-                b.rx,
-                b.tx,
-                b.total()
-            ));
+            out.push_str(&row("app", image, services, Some(b), None));
         }
         f.write_all(out.as_bytes())
             .with_context(|| format!("could not write {}", path.display()))?;

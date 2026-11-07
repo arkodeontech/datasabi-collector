@@ -6,12 +6,13 @@ A small command-line program used to test the Windows plan before the Windows co
 
 - Counts the bytes each process sends and receives, using the ETW provider `Microsoft-Windows-Kernel-Network`.
 - Labels `svchost.exe` processes with the services they host, such as `wuauserv` (Windows Update) or `DoSvc` (Delivery Optimization).
-- Compares the total with the network adapters' own byte counters.
+- Compares the total with the byte and packet counters of the adapter that carries the internet connection. Packets include headers, so the gap between the two can be estimated.
+- Records how many events the trace lost, from `logman query DataSabiProbe -ets`, so a low match can be told apart from lost events.
 - Prints the top apps every minute and saves a CSV report next to the program when it stops.
 
 ## Privacy
 
-Addresses are only looked at in memory, to skip loopback and local-network traffic. The report holds process names, service names and byte counts. It contains no addresses, website names or packet contents, and not the network's name.
+Addresses are only looked at in memory, to skip loopback and local-network traffic. The report holds process names, service names, adapter names and counts. It contains no addresses, website names or packet contents, and the network's name is neither printed nor saved.
 
 ## How to run
 
@@ -22,4 +23,4 @@ Addresses are only looked at in memory, to skip loopback and local-network traff
 
 The program isn't signed, so Windows may warn before it runs.
 
-If it says the trace couldn't start because a previous run crashed, run `logman stop DataSabiProbe -ets` and try again.
+The program clears a session left by a crashed run before it starts. If the trace still won't start, run `logman stop DataSabiProbe -ets` and try again.
