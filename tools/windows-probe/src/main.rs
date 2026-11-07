@@ -71,6 +71,38 @@ mod parse {
         fields
     }
 
+    /// Rows of `name,bytes_rx,bytes_tx,unicast_rx,other_rx,unicast_tx,other_tx` CSV
+    /// (header first), as (name, [six counts]). Rows with too few fields are skipped and
+    /// counts that do not parse are read as 0.
+    pub fn adapter_rows(csv: &str) -> Vec<(String, [u64; 6])> {
+        csv.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let f = csv_fields(line);
+                if f.len() < 7 || f[0].is_empty() {
+                    return None;
+                }
+                let mut n = [0u64; 6];
+                for (slot, v) in n.iter_mut().zip(&f[1..7]) {
+                    *slot = v.trim().parse().unwrap_or(0);
+                }
+                Some((f[0].clone(), n))
+            })
+            .collect()
+    }
+
+    /// Which adapter to compare the apps with, and how to label it in the report.
+    /// `wanted` is the adapter Windows says carries the internet connection; `found` is
+    /// every adapter name in the first counter reading. Returns `None` when the totals
+    /// must fall back to all adapters added together.
+    pub fn choose_adapter(wanted: Option<&str>, found: &[&str]) -> (Option<String>, String) {
+        match wanted {
+            Some(name) if found.contains(&name) => (Some(name.to_string()), name.to_string()),
+            Some(name) => (None, format!("{name} (not found, all adapters used)")),
+            None => (None, "unknown (all adapters used)".to_string()),
+        }
+    }
+
     /// Lines of `logman query <name> -ets` that report lost events or buffers, as
     /// (label, value) pairs, for example ("Events Lost", "0").
     pub fn lost_lines(logman_output: &str) -> Vec<(String, String)> {
@@ -115,6 +147,38 @@ mod parse {
         }
 
         #[test]
+        fn adapter_csv_rows() {
+            let out = "\"Name\",\"Rx\",\"Tx\",\"RxU\",\"RxN\",\"TxU\",\"TxN\"\r\n\
+                       \"Wi-Fi\",\"3356367038\",\"120\",\"10\",\"2\",\"8\",\"1\"\r\n\
+                       \"Ethernet\",\"0\",\"0\",\"0\",\"\",\"0\",\"0\"\r\n\
+                       \"short\",\"1\"\r\n";
+            assert_eq!(
+                adapter_rows(out),
+                vec![
+                    ("Wi-Fi".to_string(), [3356367038, 120, 10, 2, 8, 1]),
+                    ("Ethernet".to_string(), [0; 6]),
+                ]
+            );
+        }
+
+        #[test]
+        fn adapter_choice() {
+            let found = ["Ethernet", "Wi-Fi"];
+            assert_eq!(
+                choose_adapter(Some("Wi-Fi"), &found),
+                (Some("Wi-Fi".to_string()), "Wi-Fi".to_string())
+            );
+            assert_eq!(
+                choose_adapter(Some("Wi-Fi"), &["Ethernet"]),
+                (None, "Wi-Fi (not found, all adapters used)".to_string())
+            );
+            assert_eq!(
+                choose_adapter(None, &found),
+                (None, "unknown (all adapters used)".to_string())
+            );
+        }
+
+        #[test]
         fn logman_lost_lines() {
             let out = "Name:                 DataSabiProbe\r\nEvents Lost:          3\r\nBuffers Written:      10\r\n";
             assert_eq!(
@@ -142,7 +206,7 @@ mod probe {
     use ferrisetw::trace::{TraceTrait, UserTrace};
     use ferrisetw::EventRecord;
 
-    use crate::parse::{csv_fields, is_local, lost_lines};
+    use crate::parse::{adapter_rows, choose_adapter, csv_fields, is_local, lost_lines};
 
     /// Microsoft-Windows-Kernel-Network.
     const KERNEL_NETWORK: &str = "7DD42A49-5329-4832-8DFD-43D979153A88";
@@ -228,14 +292,35 @@ mod probe {
         );
         println!();
 
-        let (net_cost, internet_adapter) = network_profile();
+        let (net_cost, wanted_adapter) = network_profile();
         println!("Windows cost setting for this network: {net_cost}");
-        match &internet_adapter {
-            Some(name) => println!("Adapter carrying the internet connection: {name}"),
-            None => println!("Could not tell which adapter carries the internet connection; totals use all adapters."),
-        }
 
         let adapters_start = adapter_totals().context("could not read adapter totals")?;
+        let mut found: Vec<&str> = adapters_start.keys().map(String::as_str).collect();
+        found.sort_unstable();
+        let (internet_adapter, adapter_label) = choose_adapter(wanted_adapter.as_deref(), &found);
+        match (&wanted_adapter, &internet_adapter) {
+            (Some(name), Some(_)) => println!("Adapter carrying the internet connection: {name}"),
+            (Some(name), None) => {
+                println!();
+                println!(
+                    "WARNING: Windows says \"{name}\" carries the internet connection, but it has"
+                );
+                println!("no counters. Adapters found: {}.", found.join(", "));
+                println!(
+                    "The adapter total will be all adapters added together, which can be wrong."
+                );
+                println!("Tell whoever asked you to run this test before you go on.");
+                println!();
+            }
+            (None, _) => {
+                println!();
+                println!("WARNING: could not tell which adapter carries the internet connection.");
+                println!("Adapters found: {}.", found.join(", "));
+                println!("The adapter total will be all adapters added together.");
+                println!();
+            }
+        }
         let names: Arc<Mutex<HashMap<u32, ProcInfo>>> = Arc::new(Mutex::new(HashMap::new()));
         refresh_names(&names);
 
@@ -293,15 +378,20 @@ mod probe {
                 next_names = now + NAMES_EVERY;
             }
             if now >= next_report {
-                let adapters = adapter_totals().unwrap_or_default();
-                print_progress(
-                    started,
-                    &counters,
-                    &names,
-                    internet_adapter.as_deref(),
-                    &adapters_start,
-                    &adapters,
-                );
+                match adapter_totals() {
+                    Ok(adapters) => print_progress(
+                        started,
+                        &counters,
+                        &names,
+                        internet_adapter.as_deref(),
+                        &adapters_start,
+                        &adapters,
+                    ),
+                    Err(e) => println!(
+                        "[{} min] could not read the adapter totals this minute: {e:#}",
+                        started.elapsed().as_secs() / 60
+                    ),
+                }
                 next_report = now + REPORT_EVERY;
             }
         }
@@ -331,6 +421,7 @@ mod probe {
             elapsed,
             net_cost: &net_cost,
             internet_adapter: internet_adapter.as_deref(),
+            adapter_label: &adapter_label,
             counters: &counters,
             names: &names,
             adapters_start: &adapters_start,
@@ -441,32 +532,36 @@ mod probe {
     }
 
     /// Bytes and packets received and sent per network adapter since it started.
+    /// Read through .NET (`GetIfEntry2` underneath), because `Get-NetAdapterStatistics`
+    /// leaves out some Wi-Fi adapters: on the first trial machine it listed only an
+    /// unplugged Ethernet port.
     fn adapter_totals() -> Result<HashMap<String, Adapter>> {
         let out = powershell(
-            "Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes,\
-             ReceivedUnicastPackets,ReceivedMulticastPackets,ReceivedBroadcastPackets,\
-             SentUnicastPackets,SentMulticastPackets,SentBroadcastPackets | ConvertTo-Csv -NoTypeInformation",
+            "[System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | \
+             Where-Object { $_.NetworkInterfaceType -ne 'Loopback' } | \
+             ForEach-Object { $s = $_.GetIPStatistics(); [pscustomobject]@{ \
+             Name = $_.Name; Rx = $s.BytesReceived; Tx = $s.BytesSent; \
+             RxU = $s.UnicastPacketsReceived; RxN = $s.NonUnicastPacketsReceived; \
+             TxU = $s.UnicastPacketsSent; TxN = $s.NonUnicastPacketsSent } } | \
+             ConvertTo-Csv -NoTypeInformation",
         );
-        let mut map = HashMap::new();
-        for line in out.lines().skip(1) {
-            let f = csv_fields(line);
-            if f.len() < 9 {
-                continue;
-            }
-            let n: Vec<u64> = f[1..9].iter().map(|v| v.parse().unwrap_or(0)).collect();
-            map.insert(
-                f[0].clone(),
-                Adapter {
-                    bytes: Bytes { rx: n[0], tx: n[1] },
-                    packets: Bytes {
-                        rx: n[2] + n[3] + n[4],
-                        tx: n[5] + n[6] + n[7],
+        let map: HashMap<String, Adapter> = adapter_rows(&out)
+            .into_iter()
+            .map(|(name, n)| {
+                (
+                    name,
+                    Adapter {
+                        bytes: Bytes { rx: n[0], tx: n[1] },
+                        packets: Bytes {
+                            rx: n[2] + n[3],
+                            tx: n[4] + n[5],
+                        },
                     },
-                },
-            );
-        }
+                )
+            })
+            .collect();
         if map.is_empty() {
-            bail!("Get-NetAdapterStatistics returned nothing");
+            bail!("no network adapters found");
         }
         Ok(map)
     }
@@ -602,6 +697,7 @@ mod probe {
         elapsed: Duration,
         net_cost: &'a str,
         internet_adapter: Option<&'a str>,
+        adapter_label: &'a str,
         counters: &'a Mutex<Counters>,
         names: &'a Mutex<HashMap<u32, ProcInfo>>,
         adapters_start: &'a HashMap<String, Adapter>,
@@ -661,12 +757,7 @@ mod probe {
             format!("{:.1}", r.elapsed.as_secs_f64() / 60.0),
         ));
         out.push_str(&value("windows_cost_setting", r.net_cost.to_string()));
-        out.push_str(&value(
-            "internet_adapter",
-            r.internet_adapter
-                .unwrap_or("unknown (all adapters used)")
-                .to_string(),
-        ));
+        out.push_str(&value("internet_adapter", r.adapter_label.to_string()));
         out.push_str(&row("summary", "apps_internet", "", Some(&apps), None));
         out.push_str(&row(
             "summary",
