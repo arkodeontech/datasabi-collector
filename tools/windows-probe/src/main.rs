@@ -196,12 +196,17 @@ mod parse {
     /// Every raw reading is kept for the report, so odd counters can be looked at later.
     #[derive(Default)]
     pub struct AdapterTally {
-        /// Each adapter's last non-zero reading. An adapter's first non-zero reading is
-        /// its starting point: nothing before it is counted.
-        last: HashMap<String, Adapter>,
+        /// Each adapter's last non-zero reading, with its milliseconds since the start. An
+        /// adapter's first non-zero reading is its starting point: nothing before it is
+        /// counted.
+        last: HashMap<String, (u64, Adapter)>,
         grown: BTreeMap<String, Adapter>,
+        /// Each adapter's fastest growth between two readings, in bytes per second. A
+        /// MiFi or hotspot can't move hundreds of MB a second, so a figure like that
+        /// means a bad reading (for example a brief low reading, then the old total).
+        fastest: BTreeMap<String, u64>,
         pub restarts: u64,
-        /// (seconds since the start, adapter, raw counters), in reading order.
+        /// (milliseconds since the start, adapter, raw counters), in reading order.
         pub readings: Vec<(u64, String, Adapter)>,
     }
 
@@ -218,23 +223,28 @@ mod parse {
         /// restart would add everything counted since the PC started when the old total
         /// comes back. A real restart still shows at the next non-zero reading, which is
         /// lower than the last one.
-        pub fn update(&mut self, secs: u64, now: HashMap<String, Adapter>) -> Vec<String> {
+        pub fn update(&mut self, ms: u64, now: HashMap<String, Adapter>) -> Vec<String> {
             let mut restarted = Vec::new();
             for (name, reading) in now.into_iter().collect::<BTreeMap<_, _>>() {
-                self.readings.push((secs, name.clone(), reading));
+                self.readings.push((ms, name.clone(), reading));
                 let total = self.grown.entry(name.clone()).or_default();
                 if reading.counts() == [0; 4] {
                     continue;
                 }
-                if let Some(last) = self.last.get(&name) {
+                if let Some((last_ms, last)) = self.last.get(&name) {
                     let (grew, restart) = growth(last.counts(), reading.counts());
                     if restart {
                         self.restarts += 1;
                         restarted.push(name.clone());
                     }
-                    *total = total.plus(&Adapter::from_counts(grew));
+                    let grew = Adapter::from_counts(grew);
+                    let gap_ms = ms.saturating_sub(*last_ms).max(1);
+                    let rate = grew.bytes.total().saturating_mul(1000) / gap_ms;
+                    let fastest = self.fastest.entry(name.clone()).or_default();
+                    *fastest = (*fastest).max(rate);
+                    *total = total.plus(&grew);
                 }
-                self.last.insert(name, reading);
+                self.last.insert(name, (ms, reading));
             }
             restarted
         }
@@ -242,6 +252,15 @@ mod parse {
         /// The growth of every adapter, sorted by name.
         pub fn sorted(&self) -> Vec<(String, Adapter)> {
             self.grown.iter().map(|(n, a)| (n.clone(), *a)).collect()
+        }
+
+        /// The fastest growth in bytes per second of `adapter` (0 if it has no figure
+        /// yet), or of any adapter when no adapter is named, as with the totals.
+        pub fn fastest(&self, adapter: Option<&str>) -> u64 {
+            match adapter {
+                Some(name) => self.fastest.get(name).copied().unwrap_or(0),
+                None => self.fastest.values().copied().max().unwrap_or(0),
+            }
         }
     }
 
@@ -330,17 +349,33 @@ mod parse {
         fn tally_restart() {
             let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [100, 10, 5, 1])]));
             assert!(t
-                .update(15, reading(&[("Wi-Fi", [150, 12, 6, 2])]))
+                .update(15_000, reading(&[("Wi-Fi", [150, 12, 6, 2])]))
                 .is_empty());
             // The counters started again from zero and have counted [40, 3, 2, 1] since.
             assert_eq!(
-                t.update(30, reading(&[("Wi-Fi", [40, 3, 2, 1])])),
+                t.update(30_000, reading(&[("Wi-Fi", [40, 3, 2, 1])])),
                 vec!["Wi-Fi".to_string()]
             );
-            t.update(45, reading(&[("Wi-Fi", [60, 4, 3, 1])]));
+            t.update(45_000, reading(&[("Wi-Fi", [60, 4, 3, 1])]));
             assert_eq!(grown(&t), vec![("Wi-Fi".to_string(), [110, 6, 4, 2])]);
             assert_eq!(t.restarts, 1);
             assert_eq!(t.readings.len(), 4);
+            // Fastest step: 50 + 2 bytes in 15 s is 3.47 B/s, rounded down to 3.
+            assert_eq!(t.fastest(Some("Wi-Fi")), 3);
+            // A named adapter with no figure gives 0, not another adapter's figure.
+            assert_eq!(t.fastest(Some("Ethernet")), 0);
+            assert_eq!(t.fastest(None), 3);
+        }
+
+        #[test]
+        fn tally_low_glitch_shows_as_fastest_step() {
+            // A brief low reading that isn't all zeros, then the old total: counted as a
+            // restart plus a huge step. The fastest-step figure makes it stand out.
+            let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [5_000_000_000, 0, 0, 0])]));
+            t.update(15_000, reading(&[("Wi-Fi", [70, 0, 0, 0])]));
+            t.update(30_000, reading(&[("Wi-Fi", [5_000_000_100, 0, 0, 0])]));
+            assert_eq!(t.restarts, 1);
+            assert!(t.fastest(None) > 300_000_000);
         }
 
         #[test]
@@ -349,9 +384,9 @@ mod parse {
                 ("Ethernet", [500, 50, 5, 5]),
                 ("Wi-Fi", [100; 4]),
             ]));
-            t.update(15, reading(&[("Wi-Fi", [110; 4])]));
+            t.update(15_000, reading(&[("Wi-Fi", [110; 4])]));
             t.update(
-                30,
+                30_000,
                 reading(&[("Ethernet", [520, 51, 6, 5]), ("Wi-Fi", [120; 4])]),
             );
             assert_eq!(
@@ -368,15 +403,15 @@ mod parse {
         fn tally_all_zero_reading() {
             // All zeros for a moment, then the old total plus 100: only 100 is growth.
             let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [5_000_000_000, 9, 9, 9])]));
-            assert!(t.update(15, reading(&[("Wi-Fi", [0; 4])])).is_empty());
+            assert!(t.update(15_000, reading(&[("Wi-Fi", [0; 4])])).is_empty());
             assert!(t
-                .update(30, reading(&[("Wi-Fi", [5_000_000_100, 9, 9, 9])]))
+                .update(30_000, reading(&[("Wi-Fi", [5_000_000_100, 9, 9, 9])]))
                 .is_empty());
             assert_eq!(grown(&t), vec![("Wi-Fi".to_string(), [100, 0, 0, 0])]);
             // All zeros, then a real restart: caught at the next non-zero reading.
-            t.update(45, reading(&[("Wi-Fi", [0; 4])]));
+            t.update(45_000, reading(&[("Wi-Fi", [0; 4])]));
             assert_eq!(
-                t.update(60, reading(&[("Wi-Fi", [70, 1, 1, 1])])),
+                t.update(60_000, reading(&[("Wi-Fi", [70, 1, 1, 1])])),
                 vec!["Wi-Fi".to_string()]
             );
             assert_eq!(grown(&t), vec![("Wi-Fi".to_string(), [170, 1, 1, 1])]);
@@ -388,11 +423,11 @@ mod parse {
             // non-zero reading is the starting point, so its total isn't counted.
             let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [0; 4])]));
             t.update(
-                15,
+                15_000,
                 reading(&[("Wi-Fi", [9_000, 9, 9, 9]), ("VPN", [300, 3, 3, 3])]),
             );
             t.update(
-                30,
+                30_000,
                 reading(&[("Wi-Fi", [9_050, 9, 9, 9]), ("VPN", [310, 3, 3, 3])]),
             );
             assert_eq!(
@@ -568,7 +603,8 @@ mod probe {
             if now >= next_adapters || now >= next_report {
                 match adapter_totals() {
                     Ok(adapters) => {
-                        let restarted = tally.update(started.elapsed().as_secs(), adapters);
+                        let restarted =
+                            tally.update(started.elapsed().as_millis() as u64, adapters);
                         if !restarted.is_empty() {
                             println!(
                                 "[{} min] adapter counters started again from zero: {}. The \
@@ -606,7 +642,7 @@ mod probe {
         // losing the whole run's report.
         match adapter_totals() {
             Ok(adapters) => {
-                tally.update(started.elapsed().as_secs(), adapters);
+                tally.update(started.elapsed().as_millis() as u64, adapters);
             }
             Err(e) => println!(
                 "Could not read the adapter totals at the end ({e:#}); the last reading is used."
@@ -972,6 +1008,10 @@ mod probe {
             "adapter_counter_restarts",
             r.adapters.restarts.to_string(),
         ));
+        out.push_str(&value(
+            "internet_adapter_fastest_bytes_per_second",
+            r.adapters.fastest(r.internet_adapter).to_string(),
+        ));
         out.push_str(&row(
             "summary",
             "local_network_skipped",
@@ -995,7 +1035,8 @@ mod probe {
         for (image, services, b) in &rows {
             out.push_str(&row("app", image, services, Some(b), None));
         }
-        // Raw counter readings; here the services column holds the seconds since the start.
+        // Raw counter readings; here the services column holds the milliseconds since the
+        // start.
         for (secs, name, a) in &r.adapters.readings {
             out.push_str(&row(
                 "reading",
