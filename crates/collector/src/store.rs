@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveTime, TimeZone};
 use datasabi_protocol::{
-    AlertRule, AppHistory, AppUsage, Metered, NetworkInfo, Range, Summary, UsagePoint,
+    AlertRule, AppHistory, AppUsage, DayBoundary, Metered, NetworkInfo, Range, Summary, UsagePoint,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -90,6 +90,9 @@ pub struct UsageRow {
     pub bytes_in: u64,
     pub bytes_out: u64,
 }
+
+/// Where the day buckets made by [`Store::rollup_hours`] start.
+pub const DAY_BOUNDARY: DayBoundary = DayBoundary::Utc;
 
 /// Per (app, network): (minute start, bytes) points.
 pub type RecentUsage = HashMap<(i64, i64), Vec<(i64, u64)>>;
@@ -367,6 +370,41 @@ impl Store {
         })
     }
 
+    /// Bytes used on `networks` with bucket starts in `[from, to)`: see
+    /// [`datasabi_protocol::NetworkUsage`] for when that is exact.
+    pub fn usage_between(&self, networks: &[i64], from: i64, to: i64) -> Result<(u64, u64)> {
+        anyhow::ensure!(from <= to, "the range ends before it starts");
+        if networks.is_empty() {
+            return Ok((0, 0));
+        }
+        // ?1 and ?2 are the times; the networks are ?3, ?4 and so on, used in all three
+        // tables.
+        let list = (0..networks.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COALESCE(SUM(bi), 0), COALESCE(SUM(bo), 0) FROM (
+               SELECT bytes_in AS bi, bytes_out AS bo FROM usage_minute
+                 WHERE network_id IN ({list}) AND minute_ts >= ?1 AND minute_ts < ?2
+               UNION ALL
+               SELECT bytes_in, bytes_out FROM usage_hour
+                 WHERE network_id IN ({list}) AND hour_ts >= ?1 AND hour_ts < ?2
+               UNION ALL
+               SELECT bytes_in, bytes_out FROM usage_day
+                 WHERE network_id IN ({list}) AND day_ts >= ?1 AND day_ts < ?2
+             )"
+        );
+        let mut values: Vec<i64> = vec![from, to];
+        values.extend_from_slice(networks);
+        let (bi, bo): (i64, i64) =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(values.iter()), |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        Ok((bi as u64, bo as u64))
+    }
+
     pub fn app_history(
         &self,
         app_id: i64,
@@ -602,6 +640,93 @@ mod tests {
             .query_row("SELECT name FROM apps WHERE id = ?1", [id], |r| r.get(0))
             .unwrap();
         assert_eq!(name, "Visual Studio Code");
+    }
+
+    /// Adds `bytes` in (and a tenth of it out) for one app at `ts` on `net`.
+    fn put(s: &mut Store, app: i64, net: i64, ts: i64, bytes: u64) {
+        s.add_usage(&[UsageRow {
+            app_id: app,
+            network_id: net,
+            minute_ts: ts - ts.rem_euclid(60),
+            bytes_in: bytes,
+            bytes_out: bytes / 10,
+        }])
+        .unwrap();
+    }
+
+    #[test]
+    fn usage_between_picks_networks_and_times() {
+        let (_d, mut s) = store();
+        let ts = 1_800_000_000 - 1_800_000_000 % 86_400; // a UTC midnight
+        let app = s.upsert_app("/usr/bin/curl", "curl", None, ts).unwrap();
+        let wifi = s
+            .upsert_network("wlan0", Some("A"), Metered::Yes, ts)
+            .unwrap();
+        let usb = s
+            .upsert_network("usb0", Some("A"), Metered::Yes, ts)
+            .unwrap();
+        let other = s
+            .upsert_network("wlan0", Some("B"), Metered::No, ts)
+            .unwrap();
+        put(&mut s, app, wifi, ts - 60, 1_000); // before the start
+        put(&mut s, app, wifi, ts, 2_000);
+        put(&mut s, app, usb, ts + 3_600, 30_000); // the bundle moves to USB
+        put(&mut s, app, other, ts + 3_600, 400_000); // another bundle's network
+        put(&mut s, app, wifi, ts + 7_200, 5_000_000); // at the end: excluded
+
+        let end = ts + 7_200;
+        assert_eq!(
+            s.usage_between(&[wifi, usb], ts, end).unwrap(),
+            (32_000, 3_200)
+        );
+        assert_eq!(s.usage_between(&[wifi], ts, end).unwrap(), (2_000, 200));
+        assert_eq!(s.usage_between(&[], ts, end).unwrap(), (0, 0));
+        assert_eq!(s.usage_between(&[wifi, usb], end, end).unwrap(), (0, 0));
+        assert!(s.usage_between(&[wifi], end, ts).is_err());
+    }
+
+    #[test]
+    fn readings_from_a_day_boundary_survive_rollups() {
+        let (_d, mut s) = store();
+        let now: i64 = 1_800_000_000;
+        let day0 = now - 120 * 86_400 - (now - 120 * 86_400).rem_euclid(86_400);
+        let app = s.upsert_app("/usr/bin/curl", "curl", None, day0).unwrap();
+        let net = s
+            .upsert_network("wlan0", Some("A"), Metered::Yes, day0)
+            .unwrap();
+        // Use spread over 120 days, at odd times of day: rolled into days (older than 90
+        // days), hours (7 to 90 days) and kept as minutes (the last 7 days).
+        for (i, days_ago) in [119, 100, 95, 60, 30, 8, 3, 0].iter().enumerate() {
+            let t = now - days_ago * 86_400 - 5 * 3_600 - 17 * 60;
+            put(&mut s, app, net, t, 1_000_000 * (i as u64 + 1));
+        }
+        // Readings a bundle would store: from its start to some later times, all on the
+        // collector's day boundary (UTC, see DAY_BOUNDARY).
+        assert_eq!(DAY_BOUNDARY, DayBoundary::Utc);
+        let start = day0 + 10 * 86_400; // after the first row
+        let ends = [start + 15 * 86_400, start + 40 * 86_400, now + 86_400];
+        let before: Vec<_> = ends
+            .iter()
+            .map(|&e| s.usage_between(&[net], start, e).unwrap())
+            .collect();
+        s.rollup_minutes(now).unwrap();
+        s.rollup_hours(now).unwrap();
+        let rows = |table: &str| -> i64 {
+            s.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            (rows("usage_minute"), rows("usage_hour"), rows("usage_day")),
+            (2, 3, 3)
+        );
+        let after: Vec<_> = ends
+            .iter()
+            .map(|&e| s.usage_between(&[net], start, e).unwrap())
+            .collect();
+        assert_eq!(before, after);
+        // And the differences between readings match what was put in.
+        assert_eq!(after[2].0 - after[0].0, (3 + 4 + 5 + 6 + 7 + 8) * 1_000_000);
     }
 
     #[test]

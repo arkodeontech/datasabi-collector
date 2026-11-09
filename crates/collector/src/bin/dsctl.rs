@@ -50,6 +50,18 @@ enum Cmd {
     DeleteAlert { id: i64 },
     /// Silence alerts for N hours (0 = clear quiet mode).
     Quiet { hours: u32 },
+    /// Bytes used on some networks (ids from `dsctl networks`) between two Unix times.
+    Usage {
+        /// Network ids, comma separated.
+        #[arg(value_delimiter = ',', required = true)]
+        networks: Vec<i64>,
+        /// Start, Unix seconds (included).
+        #[arg(long)]
+        from: i64,
+        /// End, Unix seconds (excluded); now if left out.
+        #[arg(long)]
+        to: Option<i64>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -186,6 +198,11 @@ mod imp {
                 threshold_bytes: mb * BYTES_PER_MB,
             },
             Cmd::DeleteAlert { id } => Request::DeleteAlertRule { rule_id: *id },
+            Cmd::Usage { networks, from, to } => Request::GetUsage {
+                networks: networks.clone(),
+                from_unix: *from,
+                to_unix: to.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            },
             Cmd::Quiet { hours } => Request::SetQuietMode {
                 until_unix: if *hours == 0 {
                     None
@@ -285,6 +302,13 @@ mod imp {
                     );
                 }
             }
+            Response::Usage(u) if !cli.json => println!(
+                "{}  (down {}, up {}; days start at {:?} midnight)",
+                format_bytes(u.bytes_in + u.bytes_out),
+                format_bytes(u.bytes_in),
+                format_bytes(u.bytes_out),
+                u.day_boundary
+            ),
             Response::Ok => println!("ok"),
             _ => {}
         }
