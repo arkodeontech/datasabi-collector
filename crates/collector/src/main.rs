@@ -6,6 +6,7 @@
 mod aggregate;
 mod alerts;
 mod config;
+mod engine;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]

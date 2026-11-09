@@ -9,22 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppInfo {
-    pub key: String,
-    pub name: String,
-    pub exe: Option<String>,
-}
-
-impl AppInfo {
-    pub fn unknown() -> Self {
-        Self {
-            key: "unknown".into(),
-            name: "Unknown / system".into(),
-            exe: None,
-        }
-    }
-}
+pub use crate::engine::AppInfo;
 
 /// Where the identity came from, before naming.
 #[derive(Debug, Clone, PartialEq, Eq)]
