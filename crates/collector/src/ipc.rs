@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use datasabi_protocol::{
-    decode_line, encode_line, ClientMessage, Request, Response, ServerMessage, PROTOCOL_VERSION,
+    decode_line, encode_line, ClientMessage, NetworkUsage, Request, Response, ServerMessage,
+    PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -224,6 +225,22 @@ pub fn handle_request(shared: &Shared, req: Request) -> Response {
                         message: format!("no alert rule with id {rule_id}"),
                     }
                 }
+            }
+            Request::GetUsage {
+                networks,
+                from_unix,
+                to_unix,
+            } => {
+                let (bytes_in, bytes_out) = shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .usage_between(&networks, from_unix, to_unix)?;
+                Response::Usage(NetworkUsage {
+                    bytes_in,
+                    bytes_out,
+                    day_boundary: crate::store::DAY_BOUNDARY,
+                })
             }
             Request::SetQuietMode { until_unix } => {
                 let v = until_unix.unwrap_or(0);

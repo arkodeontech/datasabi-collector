@@ -10,8 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped whenever a breaking change is made to the messages below.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Raised whenever the messages below change, including when a request is added.
+/// Clients read it from [`Response::Pong`] and check it before using newer requests:
+/// a collector on an older protocol can't answer them.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Default socket path used by the Linux collector.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/datasabi/collector.sock";
@@ -69,6 +71,13 @@ pub enum Request {
     /// Silence alerts until `until_unix` (Unix seconds); `None` clears quiet mode.
     /// Returns [`Response::Ok`].
     SetQuietMode { until_unix: Option<i64> },
+    /// Bytes this computer used on the given networks from `from_unix` (included) to
+    /// `to_unix` (excluded). Returns [`Response::Usage`]. Added in protocol 2.
+    GetUsage {
+        networks: Vec<i64>,
+        from_unix: i64,
+        to_unix: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +109,31 @@ pub enum Response {
     Error {
         message: String,
     },
+    /// Answer to [`Request::GetUsage`].
+    Usage(NetworkUsage),
+}
+
+/// Bytes used on some networks between two times. Usage is stored in buckets (minutes,
+/// then hours after 7 days, then days after 90 days), and a bucket counts when its start
+/// is inside the range. So the total is exact only when both ends of the range fall on
+/// bucket boundaries; ranges that start on a `day_boundary` midnight are exact at every
+/// level. Usage from the last few seconds may not be saved yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkUsage {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// Where the collector's days start, so a client can start ranges on a day boundary.
+    pub day_boundary: DayBoundary,
+}
+
+/// Where the collector's day buckets start.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DayBoundary {
+    /// Midnight UTC.
+    Utc,
+    /// Midnight in the computer's local time.
+    Local,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -295,6 +329,36 @@ mod tests {
         let line = encode_line(&ev).unwrap();
         assert!(line.contains("\"type\":\"alert_fired\""));
         assert_eq!(decode_line::<ServerMessage>(&line).unwrap(), ev);
+    }
+
+    #[test]
+    fn usage_shapes() {
+        let msg = ClientMessage {
+            id: 9,
+            request: Request::GetUsage {
+                networks: vec![1, 13],
+                from_unix: 100,
+                to_unix: 200,
+            },
+        };
+        let line = encode_line(&msg).unwrap();
+        assert_eq!(
+            line,
+            "{\"id\":9,\"request\":{\"type\":\"get_usage\",\"networks\":[1,13],\"from_unix\":100,\"to_unix\":200}}\n"
+        );
+        assert_eq!(decode_line::<ClientMessage>(&line).unwrap(), msg);
+        let resp = ServerMessage::Response {
+            id: 9,
+            body: Response::Usage(NetworkUsage {
+                bytes_in: 5,
+                bytes_out: 1,
+                day_boundary: DayBoundary::Utc,
+            }),
+        };
+        let line = encode_line(&resp).unwrap();
+        assert!(line.contains("\"type\":\"usage\""), "{line}");
+        assert!(line.contains("\"day_boundary\":\"utc\""), "{line}");
+        assert_eq!(decode_line::<ServerMessage>(&line).unwrap(), resp);
     }
 
     #[test]
