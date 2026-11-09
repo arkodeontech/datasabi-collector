@@ -20,6 +20,7 @@ Addresses are only looked at in memory, to skip loopback and local-network traff
 2. Open PowerShell as Administrator, then go to the folder with the program.
 3. Run `.\datasabi-probe.exe`, or `.\datasabi-probe.exe --minutes 30` for a shorter run.
 4. Press Enter to stop early. The report is saved as `datasabi-probe-<number>.csv` in the same folder.
+5. Don't click inside the window while it runs. If text is selected (the title starts with "Select"), Windows pauses the program at its next line of output, and it stops reading the adapter until you press Esc. Press Esc, not Enter: Enter stops the run.
 
 The program isn't signed, so Windows may warn before it runs. If Windows blocks it, run `Unblock-File .\datasabi-probe.exe` first.
 
@@ -30,6 +31,7 @@ The program isn't signed, so Windows may warn before it runs. If Windows blocks 
 - **Note the data used before and after,** from as many of these as you have:
   - the MiFi's own usage counter on its admin page (often 192.168.0.1 or 192.168.8.1)
   - the balance in the network's app or by USSD; read it about 10 minutes after the run ends, because it updates late and is rounded
-  - on a phone hotspot: the phone's hotspot usage figure (on Android, usually Settings, then Data usage, then Hotspot), not the balance, because the phone's own apps use the same data
+  - on a phone hotspot: the phone's hotspot usage figure (on Android, usually Settings, then Data usage, then Hotspot), not the balance, because the phone's own apps use the same data. A monthly figure (for example 1–30 Nov) is fine if you read it just before and just after the run: the difference is the run
+- **Stop using the internet when the run ends,** on the computer and the phone, until you've noted the after figures. Otherwise they include data the program never saw.
 
 The program clears a session left by a crashed run before it starts. If the trace still won't start, run `logman stop DataSabiProbe -ets` and try again.

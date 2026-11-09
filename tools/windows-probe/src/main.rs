@@ -31,6 +31,7 @@ fn main() {
 /// Small helpers with no Windows dependency, so they can be unit-tested.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod parse {
+    use std::collections::{BTreeMap, HashMap};
     use std::net::IpAddr;
 
     /// Loopback, private, link-local or unspecified: traffic that never uses the bundle
@@ -103,6 +104,18 @@ mod parse {
         }
     }
 
+    /// How much an adapter's counters grew between two readings. If any counter went
+    /// down, the adapter started counting again from zero (for example after the
+    /// connection dropped and came back), so the growth is the new reading itself, and
+    /// the flag is true. Traffic between the last reading and the restart is not seen.
+    pub fn growth<const N: usize>(last: [u64; N], now: [u64; N]) -> ([u64; N], bool) {
+        if now.iter().zip(&last).any(|(n, l)| n < l) {
+            (now, true)
+        } else {
+            (std::array::from_fn(|i| now[i] - last[i]), false)
+        }
+    }
+
     /// Lines of `logman query <name> -ets` that report lost events or buffers, as
     /// (label, value) pairs, for example ("Events Lost", "0").
     pub fn lost_lines(logman_output: &str) -> Vec<(String, String)> {
@@ -118,6 +131,137 @@ mod parse {
                 }
             })
             .collect()
+    }
+
+    /// Bytes or packets, received and sent.
+    #[derive(Default, Clone, Copy)]
+    pub struct Bytes {
+        pub rx: u64,
+        pub tx: u64,
+    }
+
+    impl Bytes {
+        pub fn add(&mut self, outgoing: bool, n: u64) {
+            if outgoing {
+                self.tx += n;
+            } else {
+                self.rx += n;
+            }
+        }
+        pub fn total(&self) -> u64 {
+            self.rx + self.tx
+        }
+        pub fn plus(&self, other: &Bytes) -> Bytes {
+            Bytes {
+                rx: self.rx + other.rx,
+                tx: self.tx + other.tx,
+            }
+        }
+    }
+
+    /// One adapter's counters: bytes and packets (whole packets, headers included).
+    #[derive(Default, Clone, Copy)]
+    pub struct Adapter {
+        pub bytes: Bytes,
+        pub packets: Bytes,
+    }
+
+    impl Adapter {
+        pub fn counts(&self) -> [u64; 4] {
+            [
+                self.bytes.rx,
+                self.bytes.tx,
+                self.packets.rx,
+                self.packets.tx,
+            ]
+        }
+        pub fn from_counts(c: [u64; 4]) -> Adapter {
+            Adapter {
+                bytes: Bytes { rx: c[0], tx: c[1] },
+                packets: Bytes { rx: c[2], tx: c[3] },
+            }
+        }
+        pub fn plus(&self, other: &Adapter) -> Adapter {
+            Adapter {
+                bytes: self.bytes.plus(&other.bytes),
+                packets: self.packets.plus(&other.packets),
+            }
+        }
+    }
+
+    /// Every adapter's growth since the start, added up one reading at a time. A phone
+    /// hotspot or Wi-Fi that drops and comes back can restart the adapter's counters at
+    /// zero; comparing only the first and last readings then gives nothing (seen in the
+    /// 9 Nov 2026 hotspot run). Reading often keeps the part lost at each restart small.
+    /// Every raw reading is kept for the report, so odd counters can be looked at later.
+    #[derive(Default)]
+    pub struct AdapterTally {
+        /// Each adapter's last non-zero reading, with its milliseconds since the start. An
+        /// adapter's first non-zero reading is its starting point: nothing before it is
+        /// counted.
+        last: HashMap<String, (u64, Adapter)>,
+        grown: BTreeMap<String, Adapter>,
+        /// Each adapter's fastest growth between two readings, in bytes per second. A
+        /// MiFi or hotspot can't move hundreds of MB a second, so a figure like that
+        /// means a bad reading (for example a brief low reading, then the old total).
+        fastest: BTreeMap<String, u64>,
+        pub restarts: u64,
+        /// (milliseconds since the start, adapter, raw counters), in reading order.
+        pub readings: Vec<(u64, String, Adapter)>,
+    }
+
+    impl AdapterTally {
+        pub fn new(start: &HashMap<String, Adapter>) -> AdapterTally {
+            let mut tally = AdapterTally::default();
+            tally.update(0, start.clone());
+            tally
+        }
+
+        /// Adds a new reading and returns the adapters whose counters restarted. An
+        /// adapter missing from a reading keeps its last value. A reading of all zeros is
+        /// skipped: an adapter can show it briefly while reconnecting, and taking it as a
+        /// restart would add everything counted since the PC started when the old total
+        /// comes back. A real restart still shows at the next non-zero reading, which is
+        /// lower than the last one.
+        pub fn update(&mut self, ms: u64, now: HashMap<String, Adapter>) -> Vec<String> {
+            let mut restarted = Vec::new();
+            for (name, reading) in now.into_iter().collect::<BTreeMap<_, _>>() {
+                self.readings.push((ms, name.clone(), reading));
+                let total = self.grown.entry(name.clone()).or_default();
+                if reading.counts() == [0; 4] {
+                    continue;
+                }
+                if let Some((last_ms, last)) = self.last.get(&name) {
+                    let (grew, restart) = growth(last.counts(), reading.counts());
+                    if restart {
+                        self.restarts += 1;
+                        restarted.push(name.clone());
+                    }
+                    let grew = Adapter::from_counts(grew);
+                    let gap_ms = ms.saturating_sub(*last_ms).max(1);
+                    let rate = grew.bytes.total().saturating_mul(1000) / gap_ms;
+                    let fastest = self.fastest.entry(name.clone()).or_default();
+                    *fastest = (*fastest).max(rate);
+                    *total = total.plus(&grew);
+                }
+                self.last.insert(name, (ms, reading));
+            }
+            restarted
+        }
+
+        /// The growth of every adapter, sorted by name.
+        pub fn sorted(&self) -> Vec<(String, Adapter)> {
+            self.grown.iter().map(|(n, a)| (n.clone(), *a)).collect()
+        }
+
+        /// The fastest growth in bytes per second of `adapter` (0 if it has no figure
+        /// yet), or of any adapter when no adapter is named, as with the totals.
+        pub fn fastest(&self, adapter: Option<&str>) -> u64 {
+            match adapter {
+                Some(name) => self.fastest.get(name).copied().unwrap_or(0),
+                None => self.fastest.values().copied().max().unwrap_or(0),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -179,6 +323,123 @@ mod parse {
         }
 
         #[test]
+        fn adapter_growth() {
+            assert_eq!(growth([100, 10], [150, 12]), ([50, 2], false));
+            assert_eq!(growth([100, 10], [100, 10]), ([0, 0], false));
+            // The received counter went down: the adapter started again from zero, so
+            // every counter is taken whole, even one that is now above its last value.
+            assert_eq!(growth([100, 10], [40, 25]), ([40, 25], true));
+        }
+
+        fn reading(rows: &[(&str, [u64; 4])]) -> HashMap<String, Adapter> {
+            rows.iter()
+                .map(|(name, c)| (name.to_string(), Adapter::from_counts(*c)))
+                .collect()
+        }
+
+        fn grown(tally: &AdapterTally) -> Vec<(String, [u64; 4])> {
+            tally
+                .sorted()
+                .into_iter()
+                .map(|(name, a)| (name, a.counts()))
+                .collect()
+        }
+
+        #[test]
+        fn tally_restart() {
+            let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [100, 10, 5, 1])]));
+            assert!(t
+                .update(15_000, reading(&[("Wi-Fi", [150, 12, 6, 2])]))
+                .is_empty());
+            // The counters started again from zero and have counted [40, 3, 2, 1] since.
+            assert_eq!(
+                t.update(30_000, reading(&[("Wi-Fi", [40, 3, 2, 1])])),
+                vec!["Wi-Fi".to_string()]
+            );
+            t.update(45_000, reading(&[("Wi-Fi", [60, 4, 3, 1])]));
+            assert_eq!(grown(&t), vec![("Wi-Fi".to_string(), [110, 6, 4, 2])]);
+            assert_eq!(t.restarts, 1);
+            assert_eq!(t.readings.len(), 4);
+            // Fastest step: 50 + 2 bytes in 15 s is 3.47 B/s, rounded down to 3.
+            assert_eq!(t.fastest(Some("Wi-Fi")), 3);
+            // A named adapter with no figure gives 0, not another adapter's figure.
+            assert_eq!(t.fastest(Some("Ethernet")), 0);
+            assert_eq!(t.fastest(None), 3);
+        }
+
+        #[test]
+        fn tally_low_glitch_shows_as_fastest_step() {
+            // A brief low reading that isn't all zeros, then the old total: counted as a
+            // restart plus a huge step. The fastest-step figure makes it stand out.
+            let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [5_000_000_000, 0, 0, 0])]));
+            t.update(15_000, reading(&[("Wi-Fi", [70, 0, 0, 0])]));
+            t.update(30_000, reading(&[("Wi-Fi", [5_000_000_100, 0, 0, 0])]));
+            assert_eq!(t.restarts, 1);
+            assert!(t.fastest(None) > 300_000_000);
+        }
+
+        #[test]
+        fn tally_missing_adapter() {
+            let mut t = AdapterTally::new(&reading(&[
+                ("Ethernet", [500, 50, 5, 5]),
+                ("Wi-Fi", [100; 4]),
+            ]));
+            t.update(15_000, reading(&[("Wi-Fi", [110; 4])]));
+            t.update(
+                30_000,
+                reading(&[("Ethernet", [520, 51, 6, 5]), ("Wi-Fi", [120; 4])]),
+            );
+            assert_eq!(
+                grown(&t),
+                vec![
+                    ("Ethernet".to_string(), [20, 1, 1, 0]),
+                    ("Wi-Fi".to_string(), [20; 4]),
+                ]
+            );
+            assert_eq!(t.restarts, 0);
+        }
+
+        #[test]
+        fn tally_all_zero_reading() {
+            // All zeros for a moment, then the old total plus 100: only 100 is growth.
+            let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [5_000_000_000, 9, 9, 9])]));
+            assert!(t.update(15_000, reading(&[("Wi-Fi", [0; 4])])).is_empty());
+            assert!(t
+                .update(30_000, reading(&[("Wi-Fi", [5_000_000_100, 9, 9, 9])]))
+                .is_empty());
+            assert_eq!(grown(&t), vec![("Wi-Fi".to_string(), [100, 0, 0, 0])]);
+            // All zeros, then a real restart: caught at the next non-zero reading.
+            t.update(45_000, reading(&[("Wi-Fi", [0; 4])]));
+            assert_eq!(
+                t.update(60_000, reading(&[("Wi-Fi", [70, 1, 1, 1])])),
+                vec!["Wi-Fi".to_string()]
+            );
+            assert_eq!(grown(&t), vec![("Wi-Fi".to_string(), [170, 1, 1, 1])]);
+        }
+
+        #[test]
+        fn tally_first_non_zero_reading_is_the_start() {
+            // All zeros at the start (or an adapter seen for the first time): the first
+            // non-zero reading is the starting point, so its total isn't counted.
+            let mut t = AdapterTally::new(&reading(&[("Wi-Fi", [0; 4])]));
+            t.update(
+                15_000,
+                reading(&[("Wi-Fi", [9_000, 9, 9, 9]), ("VPN", [300, 3, 3, 3])]),
+            );
+            t.update(
+                30_000,
+                reading(&[("Wi-Fi", [9_050, 9, 9, 9]), ("VPN", [310, 3, 3, 3])]),
+            );
+            assert_eq!(
+                grown(&t),
+                vec![
+                    ("VPN".to_string(), [10, 0, 0, 0]),
+                    ("Wi-Fi".to_string(), [50, 0, 0, 0]),
+                ]
+            );
+        }
+
+        #[test]
         fn logman_lost_lines() {
             let out = "Name:                 DataSabiProbe\r\nEvents Lost:          3\r\nBuffers Written:      10\r\n";
             assert_eq!(
@@ -206,7 +467,10 @@ mod probe {
     use ferrisetw::trace::{TraceTrait, UserTrace};
     use ferrisetw::EventRecord;
 
-    use crate::parse::{adapter_rows, choose_adapter, csv_fields, is_local, lost_lines};
+    use crate::parse::{
+        adapter_rows, choose_adapter, csv_fields, is_local, lost_lines, Adapter, AdapterTally,
+        Bytes,
+    };
 
     /// Microsoft-Windows-Kernel-Network.
     const KERNEL_NETWORK: &str = "7DD42A49-5329-4832-8DFD-43D979153A88";
@@ -216,53 +480,7 @@ mod probe {
     const DEFAULT_MINUTES: u64 = 60;
     const REPORT_EVERY: Duration = Duration::from_secs(60);
     const NAMES_EVERY: Duration = Duration::from_secs(10);
-
-    #[derive(Default, Clone, Copy)]
-    struct Bytes {
-        rx: u64,
-        tx: u64,
-    }
-
-    impl Bytes {
-        fn add(&mut self, outgoing: bool, n: u64) {
-            if outgoing {
-                self.tx += n;
-            } else {
-                self.rx += n;
-            }
-        }
-        fn total(&self) -> u64 {
-            self.rx + self.tx
-        }
-        fn since(&self, start: &Bytes) -> Bytes {
-            Bytes {
-                rx: self.rx.saturating_sub(start.rx),
-                tx: self.tx.saturating_sub(start.tx),
-            }
-        }
-        fn plus(&self, other: &Bytes) -> Bytes {
-            Bytes {
-                rx: self.rx + other.rx,
-                tx: self.tx + other.tx,
-            }
-        }
-    }
-
-    /// One adapter's counters: bytes and packets (whole packets, headers included).
-    #[derive(Default, Clone, Copy)]
-    struct Adapter {
-        bytes: Bytes,
-        packets: Bytes,
-    }
-
-    impl Adapter {
-        fn since(&self, start: &Adapter) -> Adapter {
-            Adapter {
-                bytes: self.bytes.since(&start.bytes),
-                packets: self.packets.since(&start.packets),
-            }
-        }
-    }
+    const ADAPTERS_EVERY: Duration = Duration::from_secs(15);
 
     #[derive(Default)]
     struct Counters {
@@ -357,14 +575,17 @@ mod probe {
 
         println!("Running. Press Enter to stop early.");
         println!();
+        let mut tally = AdapterTally::new(&adapters_start);
+        let mut adapter_error: Option<String> = None;
         let mut next_report = started + REPORT_EVERY;
         let mut next_names = started + NAMES_EVERY;
+        let mut next_adapters = started + ADAPTERS_EVERY;
         loop {
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
-            let wake = next_report.min(next_names).min(deadline);
+            let wake = next_report.min(next_names).min(next_adapters).min(deadline);
             match enter_rx.recv_timeout(wake.saturating_duration_since(now)) {
                 Ok(()) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -377,27 +598,56 @@ mod probe {
                 refresh_names(&names);
                 next_names = now + NAMES_EVERY;
             }
-            if now >= next_report {
+            // Read the adapters on their own timer and before every report, so a report
+            // shows the totals as they are now.
+            if now >= next_adapters || now >= next_report {
                 match adapter_totals() {
-                    Ok(adapters) => print_progress(
-                        started,
-                        &counters,
-                        &names,
-                        internet_adapter.as_deref(),
-                        &adapters_start,
-                        &adapters,
-                    ),
-                    Err(e) => println!(
-                        "[{} min] could not read the adapter totals this minute: {e:#}",
-                        started.elapsed().as_secs() / 60
-                    ),
+                    Ok(adapters) => {
+                        let restarted =
+                            tally.update(started.elapsed().as_millis() as u64, adapters);
+                        if !restarted.is_empty() {
+                            println!(
+                                "[{} min] adapter counters started again from zero: {}. The \
+                                 connection probably dropped and came back; counting goes on.",
+                                started.elapsed().as_secs() / 60,
+                                restarted.join(", ")
+                            );
+                            println!();
+                        }
+                    }
+                    Err(e) => adapter_error = Some(format!("{e:#}")),
                 }
+                next_adapters = now + ADAPTERS_EVERY;
+            }
+            if now >= next_report {
+                if let Some(e) = adapter_error.take() {
+                    println!(
+                        "[{} min] could not read the adapter totals at least once this minute: {e}",
+                        started.elapsed().as_secs() / 60
+                    );
+                }
+                print_progress(
+                    started,
+                    &counters,
+                    &names,
+                    internet_adapter.as_deref(),
+                    &tally,
+                );
                 next_report = now + REPORT_EVERY;
             }
         }
 
         refresh_names(&names);
-        let adapters_end = adapter_totals().context("could not read adapter totals")?;
+        // A failed last reading keeps the totals from the reading before it, rather than
+        // losing the whole run's report.
+        match adapter_totals() {
+            Ok(adapters) => {
+                tally.update(started.elapsed().as_millis() as u64, adapters);
+            }
+            Err(e) => println!(
+                "Could not read the adapter totals at the end ({e:#}); the last reading is used."
+            ),
+        }
         // Read the session's lost-event counters while it is still running.
         let lost = lost_lines(&command_text("logman", &["query", TRACE_NAME, "-ets"]));
         let handled = trace.events_handled();
@@ -408,8 +658,7 @@ mod probe {
             &counters,
             &names,
             internet_adapter.as_deref(),
-            &adapters_start,
-            &adapters_end,
+            &tally,
         );
         if lost.is_empty() {
             println!("Lost events: unknown (logman gave no figure)");
@@ -424,8 +673,7 @@ mod probe {
             adapter_label: &adapter_label,
             counters: &counters,
             names: &names,
-            adapters_start: &adapters_start,
-            adapters_end: &adapters_end,
+            adapters: &tally,
             handled,
             lost: &lost,
         })?;
@@ -620,22 +868,6 @@ mod probe {
         rows
     }
 
-    /// Change in every adapter's counters between two readings.
-    fn adapter_deltas(
-        start: &HashMap<String, Adapter>,
-        now: &HashMap<String, Adapter>,
-    ) -> Vec<(String, Adapter)> {
-        let mut names: Vec<&String> = now.keys().collect();
-        names.sort();
-        names
-            .into_iter()
-            .filter_map(|name| {
-                let (a, s) = (now.get(name)?, start.get(name)?);
-                Some((name.clone(), a.since(s)))
-            })
-            .collect()
-    }
-
     /// The internet adapter's change if known, otherwise all adapters added together.
     fn baseline(deltas: &[(String, Adapter)], internet_adapter: Option<&str>) -> Adapter {
         if let Some(name) = internet_adapter {
@@ -645,10 +877,7 @@ mod probe {
         }
         deltas
             .iter()
-            .fold(Adapter::default(), |acc, (_, a)| Adapter {
-                bytes: acc.bytes.plus(&a.bytes),
-                packets: acc.packets.plus(&a.packets),
-            })
+            .fold(Adapter::default(), |acc, (_, a)| acc.plus(a))
     }
 
     fn mb(n: u64) -> f64 {
@@ -668,12 +897,11 @@ mod probe {
         counters: &Mutex<Counters>,
         names: &Mutex<HashMap<u32, ProcInfo>>,
         internet_adapter: Option<&str>,
-        adapters_start: &HashMap<String, Adapter>,
-        adapters_now: &HashMap<String, Adapter>,
+        tally: &AdapterTally,
     ) {
         let rows = grouped(counters, names);
         let apps: u64 = rows.iter().map(|r| r.2.total()).sum();
-        let deltas = adapter_deltas(adapters_start, adapters_now);
+        let deltas = tally.sorted();
         let adapter = baseline(&deltas, internet_adapter).bytes.total();
         println!(
             "[{} min] apps {:.1} MB | adapter {:.1} MB | apps / adapter {:.1}%",
@@ -700,8 +928,7 @@ mod probe {
         adapter_label: &'a str,
         counters: &'a Mutex<Counters>,
         names: &'a Mutex<HashMap<u32, ProcInfo>>,
-        adapters_start: &'a HashMap<String, Adapter>,
-        adapters_end: &'a HashMap<String, Adapter>,
+        adapters: &'a AdapterTally,
         handled: usize,
         lost: &'a [(String, String)],
     }
@@ -711,7 +938,7 @@ mod probe {
         let apps = rows
             .iter()
             .fold(Bytes::default(), |acc, row| acc.plus(&row.2));
-        let deltas = adapter_deltas(r.adapters_start, r.adapters_end);
+        let deltas = r.adapters.sorted();
         let base = baseline(&deltas, r.internet_adapter);
         let all = baseline(&deltas, None);
         let (local, events, unparsed, no_address) = {
@@ -777,6 +1004,14 @@ mod probe {
             Some(&all.bytes),
             Some(&all.packets),
         ));
+        out.push_str(&value(
+            "adapter_counter_restarts",
+            r.adapters.restarts.to_string(),
+        ));
+        out.push_str(&value(
+            "internet_adapter_fastest_bytes_per_second",
+            r.adapters.fastest(r.internet_adapter).to_string(),
+        ));
         out.push_str(&row(
             "summary",
             "local_network_skipped",
@@ -799,6 +1034,17 @@ mod probe {
         }
         for (image, services, b) in &rows {
             out.push_str(&row("app", image, services, Some(b), None));
+        }
+        // Raw counter readings; here the services column holds the milliseconds since the
+        // start.
+        for (secs, name, a) in &r.adapters.readings {
+            out.push_str(&row(
+                "reading",
+                name,
+                &secs.to_string(),
+                Some(&a.bytes),
+                Some(&a.packets),
+            ));
         }
         f.write_all(out.as_bytes())
             .with_context(|| format!("could not write {}", path.display()))?;
