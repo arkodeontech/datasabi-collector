@@ -1,7 +1,7 @@
 //! Local connection server speaking the newline-delimited JSON protocol from
 //! `datasabi-protocol`. The protocol handling here works over any stream; how
 //! clients connect is per platform: a group-owned Unix socket on Linux (`unix`),
-//! and a named pipe on Windows (D1, next).
+//! and a hardened named pipe on Windows (`pipe`).
 
 use std::sync::Arc;
 
@@ -15,6 +15,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::state::Shared;
 
+#[cfg(windows)]
+pub mod pipe;
 #[cfg(target_os = "linux")]
 pub mod unix;
 
