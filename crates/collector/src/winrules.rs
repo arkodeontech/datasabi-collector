@@ -319,6 +319,7 @@ pub struct AdapterTally {
     last: HashMap<String, Counters>,
     total: HashMap<String, Counters>,
     restarted: HashSet<String>,
+    restarts_by: HashMap<String, u64>,
     pub restarts: u64,
 }
 
@@ -339,6 +340,7 @@ impl AdapterTally {
             }
             let grew = if self.restarted.remove(&key) {
                 self.restarts += 1;
+                *self.restarts_by.entry(key.clone()).or_default() += 1;
                 Some(now)
             } else {
                 match self.last.get(&key) {
@@ -348,6 +350,7 @@ impl AdapterTally {
                         Some(g) => Some(g),
                         None => {
                             self.restarts += 1;
+                            *self.restarts_by.entry(key.clone()).or_default() += 1;
                             Some(now)
                         }
                     },
@@ -364,6 +367,151 @@ impl AdapterTally {
     pub fn totals(&self) -> &HashMap<String, Counters> {
         &self.total
     }
+
+    /// Each adapter's traffic since start and how many times its counters restarted:
+    /// a minute in which they restarted isn't trusted for reconciliation.
+    pub fn snapshot(&self) -> HashMap<String, (Counters, u64)> {
+        self.total
+            .iter()
+            .map(|(k, c)| {
+                (
+                    k.clone(),
+                    (*c, self.restarts_by.get(k).copied().unwrap_or(0)),
+                )
+            })
+            .collect()
+    }
+}
+
+/// The most an app's count grows when it's matched to the adapter: headers are about
+/// 3–5% (B2: 39.6–47.4 bytes a packet), so anything beyond this is something else.
+pub const RECONCILE_CAP_PERCENT: u64 = 12;
+/// What each app gets when the adapter's reading can't be trusted that minute (missing,
+/// or the counters restarted): B2's headers, roughly.
+pub const RECONCILE_FALLBACK_PERCENT: u64 = 4;
+
+/// One minute's reconciliation on one adapter, one direction (DataSabi TODO D1, decided
+/// 12 Nov 2026). ETW counts what's inside each packet, the operator bills the packets,
+/// and the adapter's counters are what left the card (B2: adapter ÷ the phone's bill
+/// 99.6%). So the apps are topped up to the adapter:
+///
+/// - `adapter`: the adapter's internet bytes that minute (its growth minus the local
+///   traffic the apps skipped), or `None` when its reading is missing or restarted.
+/// - `apps`: each app's internet bytes that minute.
+///
+/// Returns each app's extra bytes (same order) and the bytes for "Other (Windows)":
+/// - overhead = adapter − apps (never negative: an adapter below the apps adds nothing);
+/// - spread over the apps by their bytes, at most [`RECONCILE_CAP_PERCENT`] of each;
+/// - whatever is left goes to "Other (Windows)", visible rather than hidden in apps;
+///   with no apps that minute, all of it does;
+/// - with no trustworthy reading, each app gets [`RECONCILE_FALLBACK_PERCENT`] and
+///   "Other (Windows)" nothing.
+///
+/// The extras and the other add up to the overhead exactly.
+pub fn reconcile(adapter: Option<u64>, apps: &[u64]) -> (Vec<u64>, u64) {
+    let Some(adapter) = adapter else {
+        let extras = apps
+            .iter()
+            .map(|b| percent(*b, RECONCILE_FALLBACK_PERCENT))
+            .collect();
+        return (extras, 0);
+    };
+    let total: u64 = apps.iter().sum();
+    let overhead = adapter.saturating_sub(total);
+    if total == 0 {
+        return (vec![0; apps.len()], overhead);
+    }
+    let extras: Vec<u64> = apps
+        .iter()
+        .map(|b| {
+            let share = (u128::from(overhead) * u128::from(*b) / u128::from(total)) as u64;
+            share.min(percent(*b, RECONCILE_CAP_PERCENT))
+        })
+        .collect();
+    let spread: u64 = extras.iter().sum();
+    (extras, overhead - spread)
+}
+
+/// One minute on one adapter, as [`reconcile_minute`] returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinuteMatch {
+    /// Each app's extra bytes (in, out), in the order given.
+    pub extras: Vec<(u64, u64)>,
+    /// "Other (Windows)" (in, out).
+    pub other: (u64, u64),
+    /// The apps' lead over the adapter, carried into the next minute.
+    pub carry: u64,
+}
+
+/// One minute's reconciliation on one adapter, by each app's **total** (in + out), then
+/// split by direction (reviewer, 13 Nov 2026). Matching each direction on its own is
+/// wrong: a download makes the computer send acknowledgements, upload bytes on the
+/// adapter that no app's upload shows (B2 run 1+3: apps sent 14.1 MB, the adapter 70.1
+/// MB), so the upload side would look far short and push most of it into "Other".
+///
+/// - `adapter`: the adapter's internet bytes that minute (in, out), after the local
+///   traffic is taken off; `None` when its reading is missing or restarted.
+/// - `apps`: each app's (in, out) bytes that minute.
+/// - `carry`: last minute's shortfall (the apps ahead of the adapter, because the
+///   adapter is read every 5 s and minute edges don't line up). It's taken off this
+///   minute's overhead, so a burst's catch-up isn't mistaken for "Other".
+///
+/// The total overhead is shared by [`reconcile`] (capped per app, the rest to Other).
+/// Each extra, and Other, is then split into in and out in proportion to the adapter's
+/// own overhead per direction (if one direction's is zero or less, all goes to the
+/// other). With no trustworthy reading: +[`RECONCILE_FALLBACK_PERCENT`] per direction,
+/// nothing to Other, and the carry starts again.
+pub fn reconcile_minute(
+    adapter: Option<(u64, u64)>,
+    apps: &[(u64, u64)],
+    carry: u64,
+) -> MinuteMatch {
+    let Some((a_in, a_out)) = adapter else {
+        return MinuteMatch {
+            extras: apps
+                .iter()
+                .map(|(i, o)| {
+                    (
+                        percent(*i, RECONCILE_FALLBACK_PERCENT),
+                        percent(*o, RECONCILE_FALLBACK_PERCENT),
+                    )
+                })
+                .collect(),
+            other: (0, 0),
+            carry: 0,
+        };
+    };
+    let apps_in: u64 = apps.iter().map(|(i, _)| i).sum();
+    let apps_out: u64 = apps.iter().map(|(_, o)| o).sum();
+    let apps_total = apps_in + apps_out;
+    let adapter_total = a_in + a_out;
+    // The adapter catching up on last minute's lead isn't overhead.
+    let behind = apps_total + carry;
+    let new_carry = behind.saturating_sub(adapter_total);
+    let adapter_for_apps = adapter_total.saturating_sub(carry);
+    let totals: Vec<u64> = apps.iter().map(|(i, o)| i + o).collect();
+    let (extras, other) = reconcile(Some(adapter_for_apps), &totals);
+
+    // Split by the adapter's own overhead per direction.
+    let o_in = a_in.saturating_sub(apps_in);
+    let o_out = a_out.saturating_sub(apps_out);
+    let split = |x: u64| -> (u64, u64) {
+        if o_in + o_out == 0 {
+            return (x, 0);
+        }
+        let x_in = (u128::from(x) * u128::from(o_in) / u128::from(o_in + o_out)) as u64;
+        (x_in, x - x_in)
+    };
+    MinuteMatch {
+        extras: extras.into_iter().map(split).collect(),
+        other: split(other),
+        carry: new_carry,
+    }
+}
+
+/// `bytes` × `pct` / 100, rounded to the nearest byte.
+fn percent(bytes: u64, pct: u64) -> u64 {
+    ((u128::from(bytes) * u128::from(pct) + 50) / 100) as u64
 }
 
 #[cfg(test)]
@@ -624,6 +772,8 @@ mod tests {
             c(1_200_000 + 5_000_000, 10_000 + 90_000)
         );
         assert_eq!(t.restarts, 1);
+        // The restart is counted for that adapter, so that minute isn't reconciled.
+        assert_eq!(t.snapshot()["wifi"].1, 1);
         // Then ordinary growth again.
         t.update(reading(&[("wifi", c(5_100_000, 90_000))]), false);
         assert_eq!(t.totals()["wifi"].bytes_in, 6_300_000);
@@ -652,5 +802,161 @@ mod tests {
         );
         assert_eq!(t.totals()["wifi"], c(800_000, 20_000));
         assert_eq!(t.totals()["usb"], c(42_000, 1_000));
+    }
+
+    /// B2 run 1+3 (desktop, hotspot): apps 2,485.6 MB, adapter 2,600.6 MB. The 4.6%
+    /// overhead is under the cap, so it's all spread over the apps and the total
+    /// matches the adapter exactly.
+    #[test]
+    fn b2_desktop_run_is_topped_up_to_the_adapter() {
+        // DoSvc, Chrome and the rest, as in the report.
+        let apps = [
+            1_326_856_043,
+            1_150_933_423,
+            2_485_568_692 - 1_326_856_043 - 1_150_933_423,
+        ];
+        let adapter = 2_600_580_597;
+        let (extras, other) = reconcile(Some(adapter), &apps);
+        assert_eq!(other + extras.iter().sum::<u64>(), adapter - 2_485_568_692);
+        assert!(other <= 2, "only rounding is left over, got {other}");
+        let after: u64 = apps.iter().zip(&extras).map(|(a, e)| a + e).sum::<u64>() + other;
+        assert_eq!(after, adapter);
+        // Each app grows by the same share, about 4.63%.
+        for (a, e) in apps.iter().zip(&extras) {
+            let pct = *e as f64 * 100.0 / *a as f64;
+            assert!((pct - 4.627).abs() < 0.01, "{pct}");
+        }
+    }
+
+    /// B2 run 2 (laptop, hotspot, metered): apps 869.5 MB, adapter 902.0 MB: 3.7%.
+    #[test]
+    fn b2_laptop_run_is_topped_up_to_the_adapter() {
+        let apps = [
+            640_400_000,
+            188_000_000,
+            869_533_767 - 640_400_000 - 188_000_000,
+        ];
+        let (extras, other) = reconcile(Some(901_998_823), &apps);
+        let after: u64 = apps.iter().sum::<u64>() + extras.iter().sum::<u64>() + other;
+        assert_eq!(after, 901_998_823);
+        assert!(other <= 2);
+    }
+
+    #[test]
+    fn beyond_the_cap_goes_to_other() {
+        // 1,000 bytes of apps, 1,500 on the adapter: 120 (12%) to the app, 380 to Other.
+        assert_eq!(reconcile(Some(1_500), &[1_000]), (vec![120], 380));
+        // Spread by bytes, each capped: 600 and 400 bytes, 300 overhead → 72 and 48
+        // (their 12%), 180 to Other.
+        assert_eq!(reconcile(Some(1_300), &[600, 400]), (vec![72, 48], 180));
+    }
+
+    #[test]
+    fn no_apps_that_minute_means_all_to_other() {
+        assert_eq!(reconcile(Some(5_000), &[]), (vec![], 5_000));
+        assert_eq!(reconcile(Some(5_000), &[0, 0]), (vec![0, 0], 5_000));
+    }
+
+    #[test]
+    fn an_adapter_below_the_apps_adds_nothing() {
+        assert_eq!(reconcile(Some(900), &[600, 400]), (vec![0, 0], 0));
+    }
+
+    #[test]
+    fn a_restarted_or_missing_reading_gives_four_percent() {
+        assert_eq!(reconcile(None, &[1_000, 250]), (vec![40, 10], 0));
+        assert_eq!(reconcile(None, &[]), (vec![], 0));
+    }
+
+    /// B2 run 1+3, per direction as the report has it. Download: apps 2,471,437,785,
+    /// adapter 2,530,501,132. Upload: apps 14,130,907, adapter 70,079,465 (the download's
+    /// acknowledgements). By total, every app grows ~4.63% and nothing goes to Other;
+    /// each direction then adds up to the adapter's.
+    #[test]
+    fn b2_desktop_run_by_total_then_split_by_direction() {
+        let apps = [
+            (1_323_108_693, 3_747_350),  // DoSvc
+            (1_140_680_728, 10_252_695), // Chrome
+            (7_648_364, 130_862),        // the rest
+        ];
+        let m = reconcile_minute(Some((2_530_501_132, 70_079_465)), &apps, 0);
+        assert!(m.other.0 + m.other.1 <= 2, "Other got {:?}", m.other);
+        for ((i, o), (ei, eo)) in apps.iter().zip(&m.extras) {
+            let pct = (ei + eo) as f64 * 100.0 / (i + o) as f64;
+            assert!((pct - 4.627).abs() < 0.01, "{pct}");
+        }
+        let total_in: u64 = apps.iter().map(|a| a.0).sum::<u64>()
+            + m.extras.iter().map(|e| e.0).sum::<u64>()
+            + m.other.0;
+        let total_out: u64 = apps.iter().map(|a| a.1).sum::<u64>()
+            + m.extras.iter().map(|e| e.1).sum::<u64>()
+            + m.other.1;
+        assert!(total_in.abs_diff(2_530_501_132) <= 3, "{total_in}");
+        assert!(total_out.abs_diff(70_079_465) <= 3, "{total_out}");
+        assert_eq!(m.carry, 0);
+    }
+
+    /// The v1 bug: per direction, the upload side was ~56 MB short and capped at 12%,
+    /// so ~54 MB/hour went to Other. By total, it doesn't.
+    #[test]
+    fn download_acknowledgements_dont_land_in_other() {
+        let (_, other_out) = reconcile(Some(70_079_465), &[3_747_350, 10_252_695, 130_862]);
+        assert!(
+            other_out > 50_000_000,
+            "per direction, Other got {other_out}"
+        );
+        let m = reconcile_minute(
+            Some((2_530_501_132, 70_079_465)),
+            &[
+                (1_323_108_693, 3_747_350),
+                (1_140_680_728, 10_252_695),
+                (7_648_364, 130_862),
+            ],
+            0,
+        );
+        assert!(m.other.0 + m.other.1 <= 2);
+    }
+
+    /// B2 run 2 (laptop, metered): download apps 849,781,327 / adapter 875,835,963;
+    /// upload 19,752,440 / 26,162,860.
+    #[test]
+    fn b2_laptop_run_by_total_then_split_by_direction() {
+        let apps = [(640_000_000, 15_000_000), (209_781_327, 4_752_440)];
+        let m = reconcile_minute(Some((875_835_963, 26_162_860)), &apps, 0);
+        let total = apps.iter().map(|(i, o)| i + o).sum::<u64>()
+            + m.extras.iter().map(|(i, o)| i + o).sum::<u64>()
+            + m.other.0
+            + m.other.1;
+        assert_eq!(total, 875_835_963 + 26_162_860);
+        assert!(m.other.0 + m.other.1 <= 2);
+    }
+
+    /// Minute edges: the adapter (read every 5 s) lags a burst's start, then catches
+    /// up. The shortfall is carried, so nothing spills into Other.
+    #[test]
+    fn a_minute_edge_lag_is_carried_not_spilled() {
+        let m1 = reconcile_minute(Some((1_900, 0)), &[(2_000, 0)], 0);
+        assert_eq!(m1.extras, vec![(0, 0)]);
+        assert_eq!(m1.other, (0, 0));
+        assert_eq!(m1.carry, 100);
+        let m2 = reconcile_minute(Some((1_150, 0)), &[(1_000, 0)], m1.carry);
+        assert_eq!(m2.other, (0, 0));
+        assert_eq!(m2.extras, vec![(50, 0)]);
+        assert_eq!(m2.carry, 0);
+    }
+
+    #[test]
+    fn a_direction_with_no_overhead_gets_none_of_it() {
+        // Download: the adapter is below the apps; upload: 100 over. All extra is upload.
+        let m = reconcile_minute(Some((900, 1_200)), &[(1_000, 1_000)], 0);
+        assert_eq!(m.extras, vec![(0, 100)]);
+    }
+
+    #[test]
+    fn an_untrusted_minute_gives_four_percent_and_resets_the_carry() {
+        let m = reconcile_minute(None, &[(1_000, 250)], 500);
+        assert_eq!(m.extras, vec![(40, 10)]);
+        assert_eq!(m.other, (0, 0));
+        assert_eq!(m.carry, 0);
     }
 }
