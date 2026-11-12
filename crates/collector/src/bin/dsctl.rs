@@ -11,12 +11,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use datasabi_protocol::{Range, DEFAULT_SOCKET_PATH};
+use datasabi_protocol::{Range, DEFAULT_ENDPOINT};
 
 #[derive(Parser)]
 #[command(name = "dsctl", version, about = "Query the DataSabi collector")]
 struct Cli {
-    #[arg(long, default_value = DEFAULT_SOCKET_PATH)]
+    /// The collector's socket (Linux) or named pipe (Windows).
+    #[arg(long, default_value = DEFAULT_ENDPOINT)]
     socket: PathBuf,
     /// Print raw JSON responses.
     #[arg(long)]
@@ -93,17 +94,16 @@ fn main() -> Result<()> {
     imp::run(cli)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod imp {
     pub fn run(_cli: super::Cli) -> anyhow::Result<()> {
         anyhow::bail!("dsctl does not support this OS yet")
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod imp {
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
 
     use anyhow::{bail, Context, Result};
     use datasabi_protocol::{
@@ -113,20 +113,118 @@ mod imp {
 
     use super::{Cli, Cmd, NetMode};
 
+    #[cfg(unix)]
+    type Stream = std::os::unix::net::UnixStream;
+    /// A named pipe client is opened like a file.
+    #[cfg(windows)]
+    type Stream = std::fs::File;
+
+    #[cfg(unix)]
+    fn open(cli: &Cli) -> Result<Stream> {
+        Stream::connect(&cli.socket).with_context(|| {
+            format!(
+                "cannot reach the collector at {} (is it running, and are you in the datasabi group?)",
+                cli.socket.display()
+            )
+        })
+    }
+
+    #[cfg(windows)]
+    fn open(cli: &Cli) -> Result<Stream> {
+        /// ERROR_PIPE_BUSY: every instance is taken for the moment; the collector
+        /// makes a new one at once, so try again shortly.
+        const PIPE_BUSY: i32 = 231;
+        /// FILE_GENERIC_READ | FILE_WRITE_DATA: what the pipe's access list gives
+        /// signed-in users (the collector's `ipc::pipe::CLIENT_ACCESS`).
+        const CLIENT_ACCESS: u32 = 0x0012_0089 | 0x0002;
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut tries = 0;
+        loop {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .access_mode(CLIENT_ACCESS)
+                .open(&cli.socket)
+            {
+                Ok(f) => {
+                    check_server(&f, cli)?;
+                    return Ok(f);
+                }
+                Err(e) if e.raw_os_error() == Some(PIPE_BUSY) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "cannot reach the collector at {} (is the DataSabi service running?)",
+                            cli.socket.display()
+                        )
+                    })
+                }
+            }
+        }
+    }
+
+    /// Talk only to the real service. The collector refuses to start if its pipe's name
+    /// is taken, but that protects it, not its clients: if the service isn't running,
+    /// any program can create a pipe with this name. The service runs as SYSTEM, so its
+    /// pipe is owned by SYSTEM (S-1-5-18); anything else is refused before a word is sent.
+    #[cfg(windows)]
+    fn check_server(pipe: &Stream, cli: &Cli) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{
+            IsWellKnownSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            PSID,
+        };
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is open for the call (it has READ_CONTROL through
+        // CLIENT_ACCESS); `owner` points into `sd`, which Windows allocates and we free.
+        let err = unsafe {
+            GetSecurityInfo(
+                pipe.as_raw_handle(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if err != ERROR_SUCCESS {
+            bail!(
+                "cannot check who runs {} (Windows error {err}); not sending anything",
+                cli.socket.display()
+            );
+        }
+        // SAFETY: `owner` is valid until `sd` is freed just below.
+        let system = unsafe { IsWellKnownSid(owner, WinLocalSystemSid) } != 0;
+        // SAFETY: allocated by GetSecurityInfo.
+        unsafe { LocalFree(sd) };
+        if !system {
+            bail!(
+                "{} isn't owned by the system, so it isn't the DataSabi service: another \
+                 program may be posing as it. Not sending anything.",
+                cli.socket.display()
+            );
+        }
+        Ok(())
+    }
+
     struct Client {
-        reader: BufReader<UnixStream>,
-        writer: UnixStream,
+        reader: BufReader<Stream>,
+        writer: Stream,
         next_id: u64,
     }
 
     impl Client {
         fn connect(cli: &Cli) -> Result<Self> {
-            let s = UnixStream::connect(&cli.socket).with_context(|| {
-                format!(
-                    "cannot reach the collector at {} (is it running, and are you in the datasabi group?)",
-                    cli.socket.display()
-                )
-            })?;
+            let s = open(cli)?;
             Ok(Self {
                 reader: BufReader::new(s.try_clone()?),
                 writer: s,
@@ -313,5 +411,25 @@ mod imp {
             _ => {}
         }
         Ok(())
+    }
+
+    #[cfg(all(test, windows))]
+    mod tests {
+        use clap::Parser;
+
+        use super::*;
+
+        /// The impostor case: a pipe with the collector's name made by an ordinary
+        /// process (here the test, not SYSTEM) is refused before anything is sent.
+        #[tokio::test]
+        async fn a_pipe_not_owned_by_the_system_is_refused() {
+            let name = format!(r"\\.\pipe\datasabi-dsctl-test-{}", std::process::id());
+            let _impostor = tokio::net::windows::named_pipe::ServerOptions::new()
+                .create(&name)
+                .unwrap();
+            let cli = Cli::try_parse_from(["dsctl", "--socket", name.as_str(), "ping"]).unwrap();
+            let err = open(&cli).expect_err("an impostor pipe must be refused");
+            assert!(format!("{err:#}").contains("isn't owned by the system"));
+        }
     }
 }

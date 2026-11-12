@@ -18,6 +18,18 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Default socket path used by the Linux collector.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/datasabi/collector.sock";
 
+/// Default named pipe used by the Windows collector.
+pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\datasabi-collector";
+
+/// Where the collector listens by default on this OS: the socket on Linux, the named
+/// pipe on Windows. The messages are the same on both.
+#[cfg(windows)]
+pub const DEFAULT_ENDPOINT: &str = DEFAULT_PIPE_NAME;
+/// Where the collector listens by default on this OS: the socket on Linux, the named
+/// pipe on Windows. The messages are the same on both.
+#[cfg(not(windows))]
+pub const DEFAULT_ENDPOINT: &str = DEFAULT_SOCKET_PATH;
+
 /// Bytes per megabyte as displayed to users (decision: 1 GB = 1024 MB).
 pub const BYTES_PER_MB: u64 = 1024 * 1024;
 
