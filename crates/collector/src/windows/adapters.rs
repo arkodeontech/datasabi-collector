@@ -1,5 +1,6 @@
-//! This computer's network adapters and their addresses, from GetAdaptersAddresses:
-//! which adapter an address belongs to, and whether it's a VPN tunnel.
+//! This computer's network adapters: their addresses (GetAdaptersAddresses), to find
+//! which adapter an address belongs to and whether it's a VPN tunnel; and their byte
+//! counters (GetIfTable2), for the adapter thread.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -8,16 +9,23 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-    IP_ADAPTER_ADDRESSES_LH,
+    FreeMibTable, GetAdaptersAddresses, GetIfTable2, GAA_FLAG_SKIP_ANYCAST,
+    GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
+    MIB_IF_TABLE2,
 };
 use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
 
-use crate::winrules::{is_vpn_adapter, sockaddr_ip};
+use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 
-/// One adapter: its name as Windows shows it ("Wi-Fi") and whether it's a VPN tunnel.
+use crate::winrules::{
+    guid_text, is_filter_layer, is_vpn_adapter, normalize_guid, sockaddr_ip, Counters, Reading,
+};
+
+/// One adapter: its GUID (the key shared with its counters and connection profile),
+/// its name as Windows shows it ("Wi-Fi") and whether it's a VPN tunnel.
 #[derive(Debug, Clone)]
 pub struct Adapter {
+    pub id: Arc<str>,
     pub name: Arc<str>,
     pub vpn: bool,
 }
@@ -83,6 +91,7 @@ impl Adapters {
             let wanted = only.is_empty() || only.iter().any(|o| o == &name);
             if wanted {
                 let entry = Adapter {
+                    id: Arc::from(normalize_guid(&narrow(adapter.AdapterName)).as_str()),
                     name: Arc::from(name.as_str()),
                     vpn: is_vpn_adapter(adapter.IfType, &description),
                 };
@@ -109,6 +118,55 @@ impl Adapters {
     }
 }
 
+/// Every adapter's counters and whether it's up, by GUID, without filter-driver layers
+/// (they repeat their adapter's counters).
+pub fn counters() -> Result<HashMap<String, Reading>> {
+    let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    // SAFETY: Windows allocates the table; it's freed with FreeMibTable below.
+    let err = unsafe { GetIfTable2(&mut table) };
+    if err != ERROR_SUCCESS || table.is_null() {
+        bail!("GetIfTable2 failed (Windows error {err})");
+    }
+    let mut out = HashMap::new();
+    // SAFETY: the table holds NumEntries rows laid out from its `Table` field on.
+    unsafe {
+        let n = (*table).NumEntries as usize;
+        let rows = std::ptr::addr_of!((*table).Table) as *const MIB_IF_ROW2;
+        for i in 0..n {
+            let r = &*rows.add(i);
+            if is_filter_layer(r.InterfaceAndOperStatusFlags._bitfield) {
+                continue;
+            }
+            let g = r.InterfaceGuid;
+            out.insert(
+                guid_text(g.data1, g.data2, g.data3, g.data4),
+                Reading {
+                    counters: Counters {
+                        bytes_in: r.InOctets,
+                        bytes_out: r.OutOctets,
+                        packets_in: r.InUcastPkts + r.InNUcastPkts,
+                        packets_out: r.OutUcastPkts + r.OutNUcastPkts,
+                    },
+                    up: r.OperStatus == IfOperStatusUp,
+                },
+            );
+        }
+        FreeMibTable(table as *const _);
+    }
+    Ok(out)
+}
+
+/// A NUL-terminated 8-bit string from Windows (AdapterName, a GUID), or "" for null.
+fn narrow(p: *const u8) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    // SAFETY: Windows strings end with a NUL.
+    unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// A NUL-terminated UTF-16 string from Windows, or "" for null. `p` must be null or
 /// point at a NUL-terminated UTF-16 string.
 fn wide(p: *const u16) -> String {
@@ -122,4 +180,48 @@ fn wide(p: *const u16) -> String {
     }
     // SAFETY: the `len` characters before the NUL were just read.
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+
+    /// The adapter list and the counter table use the same key (the adapter's GUID).
+    #[test]
+    fn adapters_and_counters_share_keys() {
+        let adapters = Adapters::read(&[]).unwrap();
+        let counters = counters().unwrap();
+        assert!(
+            adapters
+                .by_addr
+                .values()
+                .any(|a| counters.contains_key(a.id.as_ref())),
+            "no adapter's GUID found among the counters"
+        );
+    }
+
+    /// A download makes the counters grow by at least what was received. Needs the
+    /// internet: ignored by default, run on Windows CI with `--ignored`.
+    #[test]
+    #[ignore]
+    fn counters_grow_with_a_download() {
+        let mut tally = crate::winrules::AdapterTally::default();
+        tally.update(counters().unwrap(), true);
+        let mut stream = std::net::TcpStream::connect("example.com:80").unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        tally.update(counters().unwrap(), false);
+        let grew: u64 = tally.totals().values().map(|c| c.bytes_in).sum();
+        assert!(
+            grew * 10 >= response.len() as u64 * 9,
+            "adapters grew {grew} bytes for a {}-byte response",
+            response.len()
+        );
+    }
 }

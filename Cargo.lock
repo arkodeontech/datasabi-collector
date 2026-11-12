@@ -392,6 +392,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "windows-sys 0.61.2",
  "zbus",
 ]
