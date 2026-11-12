@@ -19,7 +19,7 @@ use crate::addr::is_local_only;
 use crate::config::Config;
 use crate::engine::{now_unix, Engine};
 use crate::state::Shared;
-use crate::winrules::{app_info, local_and_remote, lost_from_logman};
+use crate::winrules::{app_info, local_and_remote, lost_from_logman, SYSTEM_PID};
 
 use adapters::Adapters;
 use etw::{Counts, Msg};
@@ -242,9 +242,15 @@ impl Capture {
         }
         // The Win32 path while the process runs; the start event's path if it has exited.
         let image = procs::image_path(pid).or_else(|| self.images.get(&pid).cloned());
-        let services = self.services.get(&pid).cloned().unwrap_or_default();
-        let info = app_info(pid, image.as_deref(), &services);
-        let id = self.engine.app_id(&info)?;
+        let id = match image {
+            // Exited before it was seen, and no start event: counted, as on Linux.
+            None if pid != SYSTEM_PID => self.engine.unknown_app_id()?,
+            _ => {
+                let services = self.services.get(&pid).cloned().unwrap_or_default();
+                self.engine
+                    .app_id(&app_info(pid, image.as_deref(), &services))?
+            }
+        };
         self.app_ids.insert(pid, id);
         Some(id)
     }

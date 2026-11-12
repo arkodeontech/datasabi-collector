@@ -45,6 +45,8 @@ pub const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;IU)";
 /// What a client asks for when it opens the pipe: FILE_GENERIC_READ (0x120089) |
 /// FILE_WRITE_DATA (0x2). A client asking for GENERIC_WRITE would be refused to
 /// signed-in users, since the access list doesn't give them that.
+// Read by the tests here; dsctl (a separate binary) keeps its own copy.
+#[allow(dead_code)]
 pub const CLIENT_ACCESS: u32 = 0x0012_0089 | 0x0002;
 
 /// A security descriptor built from SDDL by Windows, freed when dropped.
