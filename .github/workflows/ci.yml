@@ -45,4 +45,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Tests that need administrator rights and the internet (a real ETW session);
+      # GitHub's Windows runners have both.
+      - run: cargo test -- --ignored
       - run: cargo build --release
