@@ -1,65 +1,33 @@
-//! Local socket server speaking the newline-delimited JSON protocol from
-//! `datasabi-protocol`.
+//! Local connection server speaking the newline-delimited JSON protocol from
+//! `datasabi-protocol`. The protocol handling here works over any stream; how
+//! clients connect is per platform: a group-owned Unix socket on Linux (`unix`),
+//! and a named pipe on Windows (D1, next).
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use datasabi_protocol::{
     decode_line, encode_line, ClientMessage, NetworkUsage, Request, Response, ServerMessage,
     PROTOCOL_VERSION,
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::Shared;
 
+#[cfg(target_os = "linux")]
+pub mod unix;
+
 /// Longest request line accepted; anything bigger closes the connection.
 const MAX_LINE: usize = 64 * 1024;
 
-pub fn bind(path: &Path, group: Option<&str>) -> Result<UnixListener> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
-    }
-    let listener =
-        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
-    let mode = match group {
-        Some(name) => {
-            let g = nix::unistd::Group::from_name(name)?
-                .with_context(|| format!("group {name} does not exist"))?;
-            nix::unistd::chown(path, None, Some(g.gid))
-                .with_context(|| format!("giving {} to group {name}", path.display()))?;
-            0o660
-        }
-        None => {
-            tracing::warn!("no --socket-group given: socket is open to every local user");
-            0o666
-        }
-    };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    tracing::info!("listening on {}", path.display());
-    Ok(listener)
-}
-
-pub async fn serve(listener: UnixListener, shared: Arc<Shared>) -> Result<()> {
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, shared).await {
-                tracing::debug!("client disconnected: {e:#}");
-            }
-        });
-    }
-}
-
-async fn handle_client(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
-    let (read, mut write) = stream.into_split();
+/// Serves one client until it disconnects: requests in, responses and (after
+/// `Subscribe`) events out, over any stream (a Unix socket, a named pipe, a test pipe).
+pub async fn handle_client<S>(stream: S, shared: Arc<Shared>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<String>(256);
     let writer = tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
@@ -261,75 +229,43 @@ pub fn handle_request(shared: &Shared, req: Request) -> Response {
 mod tests {
     use super::*;
     use crate::store::Store;
-    use datasabi_protocol::{Range, Request};
+    use tokio::io::AsyncBufReadExt;
 
-    #[tokio::test]
-    async fn ping_summary_and_subscribe_over_socket() {
+    fn shared() -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.db")).unwrap();
-        let shared = Arc::new(Shared::new(store));
-        let sock = dir.path().join("c.sock");
-        let listener = bind(&sock, None).unwrap();
-        tokio::spawn(serve(listener, shared.clone()));
+        (dir, Arc::new(Shared::new(store)))
+    }
 
-        let stream = UnixStream::connect(&sock).await.unwrap();
-        let (r, mut w) = stream.into_split();
+    /// The protocol over an in-memory stream, so it runs on every platform (the socket
+    /// test is in `unix`): a request is answered, and a line over `MAX_LINE` closes the
+    /// connection instead of growing a buffer.
+    #[tokio::test]
+    async fn any_stream_is_served_and_a_huge_line_is_refused() {
+        let (_dir, shared) = shared();
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let served = tokio::spawn(handle_client(server, shared));
+        let (r, mut w) = tokio::io::split(client);
         let mut lines = BufReader::new(r).lines();
-        for (id, request) in [
-            (1, Request::Ping),
-            (
-                2,
-                Request::GetSummary {
-                    range: Range::Today,
-                },
-            ),
-            (3, Request::Subscribe),
-        ] {
-            let line = encode_line(&ClientMessage { id, request }).unwrap();
-            w.write_all(line.as_bytes()).await.unwrap();
-        }
-        let mut got = Vec::new();
-        for _ in 0..3 {
-            let l = lines.next_line().await.unwrap().unwrap();
-            got.push(decode_line::<ServerMessage>(&l).unwrap());
-        }
+
+        let ping = encode_line(&ClientMessage {
+            id: 7,
+            request: Request::Ping,
+        })
+        .unwrap();
+        w.write_all(ping.as_bytes()).await.unwrap();
+        let l = lines.next_line().await.unwrap().unwrap();
         assert!(matches!(
-            got[0],
+            decode_line::<ServerMessage>(&l).unwrap(),
             ServerMessage::Response {
-                id: 1,
+                id: 7,
                 body: Response::Pong { .. }
             }
         ));
-        assert!(matches!(
-            got[1],
-            ServerMessage::Response {
-                id: 2,
-                body: Response::Summary(_)
-            }
-        ));
-        assert!(matches!(
-            got[2],
-            ServerMessage::Response {
-                id: 3,
-                body: Response::Ok
-            }
-        ));
 
-        shared.publish(datasabi_protocol::Event::Live(Default::default()));
-        let l = lines.next_line().await.unwrap().unwrap();
-        assert!(matches!(
-            decode_line::<ServerMessage>(&l).unwrap(),
-            ServerMessage::Event { .. }
-        ));
-
-        w.write_all(b"not json\n").await.unwrap();
-        let l = lines.next_line().await.unwrap().unwrap();
-        assert!(matches!(
-            decode_line::<ServerMessage>(&l).unwrap(),
-            ServerMessage::Response {
-                id: 0,
-                body: Response::Error { .. }
-            }
-        ));
+        let huge = format!("{}\n", "x".repeat(MAX_LINE + 10));
+        w.write_all(huge.as_bytes()).await.unwrap();
+        let result = served.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("too large"));
     }
 }

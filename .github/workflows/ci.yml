@@ -31,3 +31,18 @@ jobs:
         with:
           name: datasabi-collector-deb
           path: target/debian/*.deb
+
+  # The Windows collector (TODO D1) is built up PR by PR; this job keeps the shared
+  # engine and everything added for Windows compiling, linted and tested there.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
