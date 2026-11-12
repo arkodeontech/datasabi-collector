@@ -7,7 +7,7 @@ pub mod etw;
 pub mod procs;
 pub mod profiles;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -17,19 +17,28 @@ use anyhow::Result;
 use datasabi_protocol::Metered;
 
 use crate::addr::is_local_only;
+use crate::aggregate::Direction;
 use crate::config::Config;
-use crate::engine::{now_unix, Engine};
+use crate::engine::{now_unix, AppInfo, Engine};
 use crate::state::Shared;
 use crate::winrules::{
-    app_info, local_and_remote, lost_from_logman, AdapterTally, Counters, SYSTEM_PID,
+    app_info, local_and_remote, lost_from_logman, reconcile_minute, AdapterTally, Counters,
+    SYSTEM_PID,
 };
 
 use adapters::{Adapter, Adapters};
 use etw::{Counts, Msg};
 use profiles::{Profile, Watch};
 
-/// Each adapter's traffic since start, by GUID, kept by the adapter thread.
-type AdapterTotals = Arc<Mutex<HashMap<String, Counters>>>;
+/// Each adapter's traffic since start and its restart count, by GUID, kept by the
+/// adapter thread.
+type AdapterTotals = Arc<Mutex<HashMap<String, (Counters, u64)>>>;
+
+/// One app on one network (app id, network id, metered), within a minute.
+type AppRow = (i64, i64, bool);
+
+/// How often the apps are reconciled with the adapters (TODO D1).
+const RECONCILE_EVERY: Duration = Duration::from_secs(60);
 
 /// The ETW session's name (one per computer).
 const SESSION: &str = "DataSabiCollector";
@@ -79,6 +88,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>) -> Result<()> {
     );
     let mut last_housekeeping = Instant::now();
     let mut last_lost = Instant::now();
+    let mut last_reconcile = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(msg) => capture.handle(msg),
@@ -92,6 +102,10 @@ pub fn run(cfg: Config, shared: Arc<Shared>) -> Result<()> {
         if last_lost.elapsed() >= LOST_EVERY {
             last_lost = Instant::now();
             capture.check_lost(&counts);
+        }
+        if last_reconcile.elapsed() >= RECONCILE_EVERY {
+            last_reconcile = Instant::now();
+            capture.reconcile_minute();
         }
         capture.engine.run_due();
         if shared.shutdown.load(Ordering::Relaxed) {
@@ -123,7 +137,7 @@ fn spawn_adapter_thread(
                     Ok(readings) => {
                         tally.update(readings, baseline);
                         baseline = false;
-                        *totals.lock().unwrap() = tally.totals().clone();
+                        *totals.lock().unwrap() = tally.snapshot();
                     }
                     Err(e) => tracing::warn!("{e:#}"),
                 }
@@ -157,8 +171,20 @@ struct Capture {
     changed: Arc<AtomicBool>,
     /// Adapter traffic since start, from the adapter thread.
     totals: AdapterTotals,
-    /// The apps' internet bytes per adapter GUID since start (in + out).
-    app_bytes: HashMap<Arc<str>, u64>,
+    /// The adapter snapshot at the last reconciliation.
+    last_totals: HashMap<String, (Counters, u64)>,
+    /// This minute's internet bytes (in, out) per adapter GUID, per app row.
+    minute_apps: HashMap<Arc<str>, HashMap<AppRow, (u64, u64)>>,
+    /// Per adapter GUID: the apps' lead over the adapter at the last minute's edge,
+    /// carried into the next reconciliation.
+    carry: HashMap<Arc<str>, u64>,
+    /// This minute's local-network bytes per adapter GUID (in, out): the adapter counts
+    /// them, the apps don't, so they come off the adapter's figure before reconciling.
+    minute_local: HashMap<Arc<str>, (u64, u64)>,
+    /// The network each adapter's traffic was last filed under, by adapter GUID.
+    nets: HashMap<Arc<str>, (i64, bool)>,
+    /// The "Other (Windows)" app's id, once made.
+    other_app: Option<i64>,
     /// Events with no address of ours, counted for the logs.
     not_ours: u64,
     /// The lost and dropped totals last logged.
@@ -191,7 +217,12 @@ impl Capture {
             profiles_read: Instant::now(),
             changed,
             totals,
-            app_bytes: HashMap::new(),
+            last_totals: HashMap::new(),
+            minute_apps: HashMap::new(),
+            carry: HashMap::new(),
+            minute_local: HashMap::new(),
+            nets: HashMap::new(),
+            other_app: None,
             not_ours: 0,
             lost_seen: (0, 0, 0),
         }
@@ -225,7 +256,7 @@ impl Capture {
         &mut self,
         pid: u32,
         size: u32,
-        dir: crate::aggregate::Direction,
+        dir: Direction,
         a: std::net::IpAddr,
         b: std::net::IpAddr,
     ) {
@@ -238,14 +269,20 @@ impl Capture {
             self.not_ours += 1;
             return;
         };
-        if is_local_only(remote) {
-            return;
-        }
         let Some(adapter) = self.adapters.get(&local).cloned() else {
             return;
         };
         if adapter.vpn {
             // Counted once, encrypted, on the physical network under the VPN app.
+            return;
+        }
+        if is_local_only(remote) {
+            // Not on the bundle; noted so it comes off the adapter's figure.
+            let l = self.minute_local.entry(adapter.id.clone()).or_default();
+            match dir {
+                Direction::In => l.0 += u64::from(size),
+                Direction::Out => l.1 += u64::from(size),
+            }
             return;
         }
         let Some((net_id, metered)) = self.network(&adapter) else {
@@ -254,7 +291,17 @@ impl Capture {
         let Some(app_id) = self.app_id(pid) else {
             return;
         };
-        *self.app_bytes.entry(adapter.id.clone()).or_default() += u64::from(size);
+        self.nets.insert(adapter.id.clone(), (net_id, metered));
+        let row = self
+            .minute_apps
+            .entry(adapter.id.clone())
+            .or_default()
+            .entry((app_id, net_id, metered))
+            .or_default();
+        match dir {
+            Direction::In => row.0 += u64::from(size),
+            Direction::Out => row.1 += u64::from(size),
+        }
         self.engine
             .add(app_id, net_id, metered, dir, u64::from(size), now_unix());
     }
@@ -293,17 +340,6 @@ impl Capture {
         let lost = lost_from_logman(&out);
         let dropped = counts.dropped.load(Ordering::Relaxed);
         let unparsed = counts.unparsed.load(Ordering::Relaxed);
-        // The adapters' traffic next to the apps' (PR 015 reconciles the two).
-        for (id, adapter) in self.totals.lock().unwrap().iter() {
-            let apps = self.app_bytes.get(id.as_str()).copied().unwrap_or(0);
-            let card = adapter.bytes_in + adapter.bytes_out;
-            if card > 0 {
-                tracing::debug!(
-                    "adapter {id}: {card} bytes, apps {apps} ({:.1}%)",
-                    apps as f64 * 100.0 / card as f64
-                );
-            }
-        }
         if (lost, dropped, unparsed) != self.lost_seen {
             tracing::warn!(
                 "events not counted so far: {lost} lost by ETW, {dropped} dropped (queue \
@@ -326,6 +362,92 @@ impl Capture {
             self.profiles = profiles;
             self.profiles_read = Instant::now();
         }
+    }
+
+    /// Matches the last minute's apps to each adapter's own figure (TODO D1, decided
+    /// 12 Nov 2026; [`reconcile_minute`]): per adapter, on each app's total (in + out),
+    /// the overhead (adapter − local traffic − apps − last minute's carried shortfall)
+    /// is spread over the apps, capped, and the rest filed as "Other (Windows)" on that
+    /// adapter's network; each extra is split into in and out by the adapter's own
+    /// overhead per direction. A minute whose reading is missing or whose counters
+    /// restarted gives the apps +4% and resets the carry. VPN adapters never appear here:
+    /// their traffic isn't counted (see `on_net`). Adapters that never carried an app's
+    /// traffic have no network yet and are left out.
+    fn reconcile_minute(&mut self) {
+        let now_totals = self.totals.lock().unwrap().clone();
+        let apps = std::mem::take(&mut self.minute_apps);
+        let local = std::mem::take(&mut self.minute_local);
+        let ids: HashSet<Arc<str>> = apps.keys().chain(self.nets.keys()).cloned().collect();
+        let ts = now_unix();
+        for id in ids {
+            let now = now_totals.get(id.as_ref());
+            let last = self.last_totals.get(id.as_ref());
+            // Trusted: read now, and no restart since the last reconciliation.
+            let trusted = match (now, last) {
+                (Some((_, r)), Some((_, r_last))) => r == r_last,
+                (Some((_, r)), None) => *r == 0,
+                (None, _) => false,
+            };
+            let (l_in, l_out) = local.get(&id).copied().unwrap_or((0, 0));
+            let adapter = trusted.then(|| {
+                let (n, p) = (
+                    now.map(|(c, _)| *c).unwrap_or_default(),
+                    last.map(|(c, _)| *c).unwrap_or_default(),
+                );
+                (
+                    n.bytes_in.saturating_sub(p.bytes_in).saturating_sub(l_in),
+                    n.bytes_out
+                        .saturating_sub(p.bytes_out)
+                        .saturating_sub(l_out),
+                )
+            });
+            let rows: Vec<(AppRow, (u64, u64))> = apps
+                .get(&id)
+                .map(|m| m.iter().map(|(row, b)| (*row, *b)).collect())
+                .unwrap_or_default();
+            let bytes: Vec<(u64, u64)> = rows.iter().map(|(_, b)| *b).collect();
+            let carry = self.carry.get(&id).copied().unwrap_or(0);
+            let m = reconcile_minute(adapter, &bytes, carry);
+            self.carry.insert(id.clone(), m.carry);
+            for (((app, net, metered), _), (e_in, e_out)) in rows.iter().zip(&m.extras) {
+                for (dir, extra) in [(Direction::In, *e_in), (Direction::Out, *e_out)] {
+                    if extra > 0 {
+                        self.engine.add(*app, *net, *metered, dir, extra, ts);
+                    }
+                }
+            }
+            if m.other != (0, 0) {
+                if let (Some((net, metered)), Some(app)) =
+                    (self.nets.get(&id).copied(), self.other_app_id())
+                {
+                    for (dir, other) in [(Direction::In, m.other.0), (Direction::Out, m.other.1)] {
+                        if other > 0 {
+                            self.engine.add(app, net, metered, dir, other, ts);
+                        }
+                    }
+                }
+            }
+            tracing::debug!(
+                "reconciled {id}: apps {:?} B, adapter {adapter:?}, carry {carry} → {}, extra {:?}, other {:?}",
+                bytes.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)),
+                m.carry,
+                m.extras.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)),
+                m.other
+            );
+        }
+        self.last_totals = now_totals;
+    }
+
+    /// "Other (Windows)": what left the adapter beyond the apps and their headers.
+    fn other_app_id(&mut self) -> Option<i64> {
+        if self.other_app.is_none() {
+            self.other_app = self.engine.app_id(&AppInfo {
+                key: "windows:other".into(),
+                name: "Other (Windows)".into(),
+                exe: None,
+            });
+        }
+        self.other_app
     }
 
     /// Network id and metered flag for an adapter: the network's name (the Wi-Fi
