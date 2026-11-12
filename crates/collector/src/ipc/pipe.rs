@@ -79,6 +79,13 @@ impl SecurityDescriptor {
     }
 }
 
+impl SecurityDescriptor {
+    /// The descriptor itself, for Windows calls that read it (valid while `self` lives).
+    pub fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+}
+
 impl Drop for SecurityDescriptor {
     fn drop(&mut self) {
         // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.

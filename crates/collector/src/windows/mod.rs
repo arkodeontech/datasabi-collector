@@ -6,6 +6,7 @@ pub mod adapters;
 pub mod etw;
 pub mod procs;
 pub mod profiles;
+pub mod service;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -6,8 +6,9 @@
         <File Id="CollectorExeFile" Source="datasabi-collector.exe" KeyPath="yes" />
         <ServiceInstall Id="CollectorService"
                         Name="DataSabiCollector"
-                        DisplayName="DataSabi Collector"
-                        Description="Measures per-app internet data usage for DataSabi. Data stays on this PC."
+                        DisplayName="DataSabi service"
+                        Description="Measures how much internet data each app uses, for the DataSabi app. Nothing is sent over the internet."
+                        Arguments="service"
                         Type="ownProcess"
                         Start="auto"
                         ErrorControl="normal"
