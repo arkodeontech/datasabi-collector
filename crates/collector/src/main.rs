@@ -7,7 +7,6 @@ mod aggregate;
 mod alerts;
 mod config;
 mod engine;
-#[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -63,9 +62,9 @@ fn run(cfg: Config) -> Result<()> {
     };
 
     let result = rt.block_on(async {
-        let listener = ipc::bind(&cfg.socket, cfg.socket_group.as_deref())?;
+        let listener = ipc::unix::bind(&cfg.socket, cfg.socket_group.as_deref())?;
         tokio::select! {
-            r = ipc::serve(listener, shared.clone()) => r,
+            r = ipc::unix::serve(listener, shared.clone()) => r,
             r = done_rx => match r {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e.context("capture engine failed")),
