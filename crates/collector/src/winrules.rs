@@ -363,7 +363,9 @@ impl AdapterTally {
         }
     }
 
-    /// Traffic since the collector started, per adapter key.
+    /// Traffic since the collector started, per adapter key (the tests' view; the
+    /// capture uses [`Self::snapshot`]).
+    #[cfg(test)]
     pub fn totals(&self) -> &HashMap<String, Counters> {
         &self.total
     }
