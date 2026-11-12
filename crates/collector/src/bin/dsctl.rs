@@ -428,7 +428,7 @@ mod imp {
                 .create(&name)
                 .unwrap();
             let cli = Cli::try_parse_from(["dsctl", "--socket", name.as_str(), "ping"]).unwrap();
-            let err = open(&cli).err().expect("an impostor pipe must be refused");
+            let err = open(&cli).expect_err("an impostor pipe must be refused");
             assert!(format!("{err:#}").contains("isn't owned by the system"));
         }
     }

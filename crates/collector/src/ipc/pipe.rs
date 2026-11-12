@@ -320,9 +320,10 @@ mod tests {
     async fn a_taken_name_is_refused() {
         let name = unique_name();
         let _first = bind(&name).unwrap();
-        let err = bind(&name)
-            .err()
-            .expect("a second first instance must fail");
-        assert!(format!("{err:#}").contains("already using it"));
+        // `Listener` has no Debug, so no `expect_err`.
+        match bind(&name) {
+            Ok(_) => panic!("a second first instance must fail"),
+            Err(err) => assert!(format!("{err:#}").contains("already using it")),
+        }
     }
 }
