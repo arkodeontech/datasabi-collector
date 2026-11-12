@@ -5,7 +5,10 @@
 // Only the tests use these on other platforms.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use datasabi_protocol::Metered;
 
 use crate::aggregate::Direction;
 use crate::engine::AppInfo;
@@ -217,6 +220,152 @@ pub fn lost_from_logman(text: &str) -> u64 {
         .sum()
 }
 
+/// Windows' cost setting for a connection (NetworkCostType) → metered. Unrestricted is
+/// unlimited; Fixed (a data cap) and Variable (pay per use) are metered; Unknown stays
+/// unknown, which the store treats as metered. A MiFi or phone hotspot often reads
+/// Unrestricted (B4, B2), so the user's own choice (FR-21) still wins, in the store.
+pub fn cost_metered(cost_type: i32) -> Metered {
+    match cost_type {
+        1 => Metered::No,
+        2 | 3 => Metered::Yes,
+        _ => Metered::Unknown,
+    }
+}
+
+/// A GUID as Windows writes it, upper case without braces: the key that joins an
+/// adapter (GetAdaptersAddresses), its counters (GetIfTable2) and its connection profile.
+pub fn guid_text(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> String {
+    format!(
+        "{data1:08X}-{data2:04X}-{data3:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        data4[0], data4[1], data4[2], data4[3], data4[4], data4[5], data4[6], data4[7]
+    )
+}
+
+/// The same key from a GUID's text, as GetAdaptersAddresses gives it ("{6b29fc40-…}").
+pub fn normalize_guid(text: &str) -> String {
+    text.trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .to_ascii_uppercase()
+}
+
+/// MIB_IF_ROW2's FilterInterface flag (bit 1): a filter driver's layer over a real
+/// adapter (e.g. "Wi-Fi-WFP Native MAC Layer LightWeight Filter"), which repeats that
+/// adapter's counters. Skipped, or the adapter would be counted twice.
+pub fn is_filter_layer(flags: u8) -> bool {
+    flags & 0b10 != 0
+}
+
+/// An adapter's counters at one reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub packets_in: u64,
+    pub packets_out: u64,
+}
+
+impl Counters {
+    fn is_zero(&self) -> bool {
+        *self == Counters::default()
+    }
+
+    /// `self` − `last`, or `None` if any counter went down (the counters restarted).
+    fn since(&self, last: &Counters) -> Option<Counters> {
+        Some(Counters {
+            bytes_in: self.bytes_in.checked_sub(last.bytes_in)?,
+            bytes_out: self.bytes_out.checked_sub(last.bytes_out)?,
+            packets_in: self.packets_in.checked_sub(last.packets_in)?,
+            packets_out: self.packets_out.checked_sub(last.packets_out)?,
+        })
+    }
+
+    fn add(&mut self, other: &Counters) {
+        self.bytes_in += other.bytes_in;
+        self.bytes_out += other.bytes_out;
+        self.packets_in += other.packets_in;
+        self.packets_out += other.packets_out;
+    }
+}
+
+/// One reading of an adapter: its counters, and whether it was up (connected).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reading {
+    pub counters: Counters,
+    pub up: bool,
+}
+
+/// Each adapter's traffic since the collector started, from repeated readings of its
+/// counters (B2's lessons, `windows-plan.md` §7):
+///
+/// - The first reading at start is the baseline: what an adapter carried before the
+///   collector ran isn't counted.
+/// - When an adapter goes down (the connection dropped, or the Wi-Fi was off), Windows
+///   starts its counters again from zero when it's back. So a reading while it's down
+///   marks it restarted, and its first reading once up counts **in full**, even if the
+///   new counter has already passed the old one (B2 run 1+3: 2.2 MB before a drop, up
+///   to 3 MB/s after; comparing with the old value would lose up to that much).
+/// - Counters that go down while it stays up also mean a restart: the new reading
+///   counts in full.
+/// - An adapter that appears after start counts its first reading in full. (The probe
+///   skipped it, and lost the first seconds after the Wi-Fi came on.)
+/// - A brief all-zero reading while an adapter stays up is ignored, so the old total
+///   coming back isn't counted twice.
+///
+/// It relies on Windows restarting the counters across a down/up, as seen on the
+/// desktop and laptop in B2; D4 checks it on more machines.
+#[derive(Debug, Default)]
+pub struct AdapterTally {
+    last: HashMap<String, Counters>,
+    total: HashMap<String, Counters>,
+    restarted: HashSet<String>,
+    pub restarts: u64,
+}
+
+impl AdapterTally {
+    /// Adds a reading (adapter key → reading). `baseline`: the first reading at start.
+    pub fn update(&mut self, readings: HashMap<String, Reading>, baseline: bool) {
+        for (key, Reading { counters: now, up }) in readings {
+            if !up {
+                self.restarted.insert(key);
+                continue;
+            }
+            if now.is_zero() {
+                // Up at zero at start: a baseline of zero, so the next reading counts.
+                if baseline {
+                    self.last.entry(key).or_default();
+                }
+                continue;
+            }
+            let grew = if self.restarted.remove(&key) {
+                self.restarts += 1;
+                Some(now)
+            } else {
+                match self.last.get(&key) {
+                    None if baseline => None,
+                    None => Some(now),
+                    Some(last) => match now.since(last) {
+                        Some(g) => Some(g),
+                        None => {
+                            self.restarts += 1;
+                            Some(now)
+                        }
+                    },
+                }
+            };
+            if let Some(g) = grew {
+                self.total.entry(key.clone()).or_default().add(&g);
+            }
+            self.last.insert(key, now);
+        }
+    }
+
+    /// Traffic since the collector started, per adapter key.
+    pub fn totals(&self) -> &HashMap<String, Counters> {
+        &self.total
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +526,131 @@ mod tests {
         let out = "Name: DataSabiCollector\nEvents Lost:   3\nBuffers Lost: 2\nBuffer Size: 64\n";
         assert_eq!(lost_from_logman(out), 5);
         assert_eq!(lost_from_logman("no session"), 0);
+    }
+
+    #[test]
+    fn windows_cost_settings_become_metered() {
+        assert_eq!(cost_metered(1), Metered::No);
+        assert_eq!(cost_metered(2), Metered::Yes);
+        assert_eq!(cost_metered(3), Metered::Yes);
+        assert_eq!(cost_metered(0), Metered::Unknown);
+        assert_eq!(cost_metered(9), Metered::Unknown);
+    }
+
+    #[test]
+    fn guids_are_one_key_whatever_their_source() {
+        let from_struct = guid_text(
+            0x6B29_FC40,
+            0xCA47,
+            0x1067,
+            [0xB3, 0x1D, 0x00, 0xDD, 0x01, 0x06, 0x62, 0xDA],
+        );
+        assert_eq!(from_struct, "6B29FC40-CA47-1067-B31D-00DD010662DA");
+        assert_eq!(
+            normalize_guid("{6b29fc40-ca47-1067-b31d-00dd010662da}"),
+            from_struct
+        );
+    }
+
+    #[test]
+    fn filter_layers_are_skipped() {
+        assert!(is_filter_layer(0b0000_0010));
+        assert!(is_filter_layer(0b0000_0011));
+        assert!(!is_filter_layer(0b0000_0101)); // hardware, connector present
+    }
+
+    fn c(bytes_in: u64, bytes_out: u64) -> Counters {
+        Counters {
+            bytes_in,
+            bytes_out,
+            packets_in: bytes_in / 1000,
+            packets_out: bytes_out / 1000,
+        }
+    }
+
+    /// Readings of adapters that are up.
+    fn reading(pairs: &[(&str, Counters)]) -> HashMap<String, Reading> {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    Reading {
+                        counters: *v,
+                        up: true,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// One adapter that's down.
+    fn down(key: &str) -> HashMap<String, Reading> {
+        HashMap::from([(key.to_string(), Reading::default())])
+    }
+
+    #[test]
+    fn the_tally_counts_only_what_happens_after_start() {
+        let mut t = AdapterTally::default();
+        // Wi-Fi had carried 1.2 GB before the collector started: not counted.
+        t.update(reading(&[("wifi", c(1_200_000_000, 50_000_000))]), true);
+        assert_eq!(t.totals().get("wifi"), None);
+        t.update(reading(&[("wifi", c(1_200_500_000, 50_020_000))]), false);
+        assert_eq!(t.totals()["wifi"], c(500_000, 20_000));
+    }
+
+    #[test]
+    fn a_restart_counts_the_new_reading_in_full() {
+        let mut t = AdapterTally::default();
+        t.update(reading(&[("wifi", c(9_000_000, 100_000))]), true);
+        t.update(reading(&[("wifi", c(9_400_000, 120_000))]), false);
+        // The hotspot dropped and came back: counters started again.
+        t.update(reading(&[("wifi", c(300_000, 10_000))]), false);
+        assert_eq!(t.totals()["wifi"], c(700_000, 30_000));
+        assert_eq!(t.restarts, 1);
+    }
+
+    #[test]
+    fn a_drop_then_a_quick_climb_counts_the_new_reading_in_full() {
+        // B2 run 1+3: 2.2 MB before the hotspot dropped; within the 5 s between readings
+        // the new counter already passed it (up to 3 MB/s).
+        let mut t = AdapterTally::default();
+        t.update(reading(&[("wifi", c(1_000_000, 50_000))]), true);
+        t.update(reading(&[("wifi", c(2_200_000, 60_000))]), false);
+        t.update(down("wifi"), false);
+        t.update(reading(&[("wifi", c(5_000_000, 90_000))]), false);
+        assert_eq!(
+            t.totals()["wifi"],
+            c(1_200_000 + 5_000_000, 10_000 + 90_000)
+        );
+        assert_eq!(t.restarts, 1);
+        // Then ordinary growth again.
+        t.update(reading(&[("wifi", c(5_100_000, 90_000))]), false);
+        assert_eq!(t.totals()["wifi"].bytes_in, 6_300_000);
+    }
+
+    #[test]
+    fn a_brief_zero_isnt_a_restart() {
+        let mut t = AdapterTally::default();
+        t.update(reading(&[("wifi", c(9_000_000, 100_000))]), true);
+        t.update(reading(&[("wifi", c(0, 0))]), false);
+        // The old total comes back: only the growth since is counted.
+        t.update(reading(&[("wifi", c(9_100_000, 100_000))]), false);
+        assert_eq!(t.totals()["wifi"], c(100_000, 0));
+        assert_eq!(t.restarts, 0);
+    }
+
+    #[test]
+    fn an_adapter_that_comes_up_later_counts_its_first_reading() {
+        let mut t = AdapterTally::default();
+        // Wi-Fi off at start (down), and a USB tether not there at all.
+        t.update(down("wifi"), true);
+        t.update(reading(&[("wifi", c(5_186, 0))]), false);
+        t.update(
+            reading(&[("wifi", c(800_000, 20_000)), ("usb", c(42_000, 1_000))]),
+            false,
+        );
+        assert_eq!(t.totals()["wifi"], c(800_000, 20_000));
+        assert_eq!(t.totals()["usb"], c(42_000, 1_000));
     }
 }

@@ -35,6 +35,15 @@ zbus = { version = "5", default-features = false, features = ["blocking-api", "a
 [target.'cfg(windows)'.dependencies]
 # ETW: the per-process network events (as in tools/windows-probe).
 ferrisetw = "1.2"
+# Connection profiles (network name, Windows' cost setting) and network-change
+# notifications are WinRT; already in the tree through ferrisetw.
+windows = { version = "0.57", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Networking",
+    "Networking_Connectivity",
+    "Win32_System_WinRT",
+] }
 # The pipe's access list, adapters and addresses, process files and services.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

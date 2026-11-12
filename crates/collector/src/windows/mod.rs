@@ -5,11 +5,12 @@
 pub mod adapters;
 pub mod etw;
 pub mod procs;
+pub mod profiles;
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,10 +20,16 @@ use crate::addr::is_local_only;
 use crate::config::Config;
 use crate::engine::{now_unix, Engine};
 use crate::state::Shared;
-use crate::winrules::{app_info, local_and_remote, lost_from_logman, SYSTEM_PID};
+use crate::winrules::{
+    app_info, local_and_remote, lost_from_logman, AdapterTally, Counters, SYSTEM_PID,
+};
 
-use adapters::Adapters;
+use adapters::{Adapter, Adapters};
 use etw::{Counts, Msg};
+use profiles::{Profile, Watch};
+
+/// Each adapter's traffic since start, by GUID, kept by the adapter thread.
+type AdapterTotals = Arc<Mutex<HashMap<String, Counters>>>;
 
 /// The ETW session's name (one per computer).
 const SESSION: &str = "DataSabiCollector";
@@ -34,6 +41,9 @@ const NET_REFRESH: Duration = Duration::from_secs(5);
 const ADAPTERS_MISS_GAP: Duration = Duration::from_secs(1);
 const SERVICES_EVERY: Duration = Duration::from_secs(60);
 const LOST_EVERY: Duration = Duration::from_secs(60);
+/// The adapter thread reads the counters this often (B2: the probe's readings, done on
+/// the trace's thread, slipped to 32–93 s under load; here they have their own thread).
+const ADAPTERS_EVERY: Duration = Duration::from_secs(5);
 
 pub fn run(cfg: Config, shared: Arc<Shared>) -> Result<()> {
     if cfg.socket_group.is_some() {
@@ -41,11 +51,32 @@ pub fn run(cfg: Config, shared: Arc<Shared>) -> Result<()> {
             "--socket-group is ignored on Windows: the pipe's access list decides who connects"
         );
     }
+    // Connection profiles are WinRT: this thread joins the multithreaded apartment.
+    // SAFETY: plain initialisation call; an error means it was already initialised.
+    if let Err(e) = unsafe {
+        windows::Win32::System::WinRT::RoInitialize(
+            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+        )
+    } {
+        tracing::debug!("RoInitialize: {e}");
+    }
+    let changed = Arc::new(AtomicBool::new(true));
+    let _watch = Watch::start(changed.clone());
+
+    let totals: AdapterTotals = Arc::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let counter_thread = spawn_adapter_thread(totals.clone(), stop.clone())?;
+
     let (tx, rx) = mpsc::sync_channel::<Msg>(CHANNEL_CAPACITY);
     let counts = Arc::new(Counts::default());
     let session = etw::start(SESSION, tx, counts.clone())?;
 
-    let mut capture = Capture::new(Engine::new(shared.clone())?, cfg.interfaces.clone());
+    let mut capture = Capture::new(
+        Engine::new(shared.clone())?,
+        cfg.interfaces.clone(),
+        changed,
+        totals,
+    );
     let mut last_housekeeping = Instant::now();
     let mut last_lost = Instant::now();
     loop {
@@ -68,9 +99,41 @@ pub fn run(cfg: Config, shared: Arc<Shared>) -> Result<()> {
         }
     }
     session.stop();
+    stop.store(true, Ordering::Relaxed);
+    let _ = counter_thread.join();
     capture.engine.flush();
     tracing::info!("capture engine stopped");
     Ok(())
+}
+
+/// Reads every adapter's counters every [`ADAPTERS_EVERY`] on its own thread, so the
+/// readings never wait behind the capture, and keeps each adapter's traffic since start
+/// (restart-aware; see [`AdapterTally`]). PR 015 reconciles the apps with it.
+fn spawn_adapter_thread(
+    totals: AdapterTotals,
+    stop: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    Ok(std::thread::Builder::new()
+        .name("adapters".into())
+        .spawn(move || {
+            let mut tally = AdapterTally::default();
+            let mut baseline = true;
+            while !stop.load(Ordering::Relaxed) {
+                match adapters::counters() {
+                    Ok(readings) => {
+                        tally.update(readings, baseline);
+                        baseline = false;
+                        *totals.lock().unwrap() = tally.totals().clone();
+                    }
+                    Err(e) => tracing::warn!("{e:#}"),
+                }
+                let next = Instant::now() + ADAPTERS_EVERY;
+                while Instant::now() < next && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            tracing::debug!("adapter counters restarted {} times", tally.restarts);
+        })?)
 }
 
 /// The Windows side: finds each event's app and network and feeds the bytes into the
@@ -87,6 +150,15 @@ struct Capture {
     services_dirty: bool,
     app_ids: HashMap<u32, i64>,
     net_checked: HashMap<Arc<str>, Instant>,
+    /// Each connected adapter's network (name, Windows' cost), by adapter GUID.
+    profiles: HashMap<String, Profile>,
+    profiles_read: Instant,
+    /// Set by Windows' network-change notification: re-read the profiles now.
+    changed: Arc<AtomicBool>,
+    /// Adapter traffic since start, from the adapter thread.
+    totals: AdapterTotals,
+    /// The apps' internet bytes per adapter GUID since start (in + out).
+    app_bytes: HashMap<Arc<str>, u64>,
     /// Events with no address of ours, counted for the logs.
     not_ours: u64,
     /// The lost and dropped totals last logged.
@@ -94,7 +166,12 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(engine: Engine, only: Vec<String>) -> Self {
+    fn new(
+        engine: Engine,
+        only: Vec<String>,
+        changed: Arc<AtomicBool>,
+        totals: AdapterTotals,
+    ) -> Self {
         let adapters = Adapters::read(&only).unwrap_or_else(|e| {
             tracing::warn!("{e:#}");
             Adapters::default()
@@ -110,6 +187,11 @@ impl Capture {
             services_dirty: false,
             app_ids: HashMap::new(),
             net_checked: HashMap::new(),
+            profiles: HashMap::new(),
+            profiles_read: Instant::now(),
+            changed,
+            totals,
+            app_bytes: HashMap::new(),
             not_ours: 0,
             lost_seen: (0, 0, 0),
         }
@@ -166,12 +248,13 @@ impl Capture {
             // Counted once, encrypted, on the physical network under the VPN app.
             return;
         }
-        let Some((net_id, metered)) = self.network(&adapter.name) else {
+        let Some((net_id, metered)) = self.network(&adapter) else {
             return;
         };
         let Some(app_id) = self.app_id(pid) else {
             return;
         };
+        *self.app_bytes.entry(adapter.id.clone()).or_default() += u64::from(size);
         self.engine
             .add(app_id, net_id, metered, dir, u64::from(size), now_unix());
     }
@@ -186,6 +269,7 @@ impl Capture {
 
     fn housekeeping(&mut self) {
         self.read_adapters();
+        self.read_profiles_if_due();
         if self.services_dirty || self.services_read.elapsed() >= SERVICES_EVERY {
             self.services = procs::services_by_pid();
             self.services_read = Instant::now();
@@ -209,6 +293,17 @@ impl Capture {
         let lost = lost_from_logman(&out);
         let dropped = counts.dropped.load(Ordering::Relaxed);
         let unparsed = counts.unparsed.load(Ordering::Relaxed);
+        // The adapters' traffic next to the apps' (PR 015 reconciles the two).
+        for (id, adapter) in self.totals.lock().unwrap().iter() {
+            let apps = self.app_bytes.get(id.as_str()).copied().unwrap_or(0);
+            let card = adapter.bytes_in + adapter.bytes_out;
+            if card > 0 {
+                tracing::debug!(
+                    "adapter {id}: {card} bytes, apps {apps} ({:.1}%)",
+                    apps as f64 * 100.0 / card as f64
+                );
+            }
+        }
         if (lost, dropped, unparsed) != self.lost_seen {
             tracing::warn!(
                 "events not counted so far: {lost} lost by ETW, {dropped} dropped (queue \
@@ -219,10 +314,26 @@ impl Capture {
         }
     }
 
-    /// Network id and metered flag for an adapter, re-checked every few seconds. The
-    /// network's name and Windows' cost setting come in the next PR; until then the
-    /// adapter's name is used and the cost is unknown (treated as metered).
-    fn network(&mut self, iface: &Arc<str>) -> Option<(i64, bool)> {
+    /// Re-reads the connection profiles when Windows reported a change, or every
+    /// [`NET_REFRESH`] anyway; a change makes every adapter's network be asked again.
+    fn read_profiles_if_due(&mut self) {
+        let notified = self.changed.swap(false, Ordering::Relaxed);
+        if notified || self.profiles_read.elapsed() >= NET_REFRESH {
+            let profiles = profiles::read();
+            if notified || profiles != self.profiles {
+                self.net_checked.clear();
+            }
+            self.profiles = profiles;
+            self.profiles_read = Instant::now();
+        }
+    }
+
+    /// Network id and metered flag for an adapter: the network's name (the Wi-Fi
+    /// name) and Windows' cost setting from its connection profile (the user's own
+    /// choice wins, in the store), re-checked every few seconds or on a change.
+    fn network(&mut self, adapter: &Adapter) -> Option<(i64, bool)> {
+        self.read_profiles_if_due();
+        let iface = &adapter.name;
         if let (Some(checked), Some(net)) = (
             self.net_checked.get(iface),
             self.engine.cached_network(iface),
@@ -231,7 +342,11 @@ impl Capture {
                 return Some(net);
             }
         }
-        let net = self.engine.network(iface, None, Metered::Unknown)?;
+        let (name, detected) = match self.profiles.get(adapter.id.as_ref()) {
+            Some(p) => (p.name.clone(), p.detected),
+            None => (None, Metered::Unknown),
+        };
+        let net = self.engine.network(iface, name, detected)?;
         self.net_checked.insert(iface.clone(), Instant::now());
         Some(net)
     }
