@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use datasabi_protocol::Metered;
 
@@ -157,18 +157,253 @@ fn app_folder(image: &str) -> Option<&str> {
     })
 }
 
-/// An app's identity from its process: the kernel, a svchost by the services it runs,
-/// or a program by its file.
+/// A running Windows service: its short name (`DoSvc`) and Windows' display name for
+/// it ("Delivery Optimization", in the PC's language).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Service {
+    pub name: String,
+    pub display: String,
+}
+
+/// What a program file says about itself in its version information.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileNames {
+    /// FileDescription, e.g. "Google Chrome".
+    pub description: Option<String>,
+    /// ProductName, e.g. "Google Chrome" or "Microsoft® Windows® Operating System".
+    pub product: Option<String>,
+}
+
+/// Services counted together as one app: (service, app key, app name). Windows Update
+/// downloads mostly through Delivery Optimization (`DoSvc`), which also carries
+/// Microsoft Store updates (B3, `windows-plan.md` §3.2); `wuauserv` and the Update
+/// Orchestrator check, BITS and the Store's install service download too.
+const SERVICE_GROUPS: &[(&str, &str, &str)] = &[
+    ("dosvc", "windows:update", "Windows Update and Store"),
+    ("wuauserv", "windows:update", "Windows Update and Store"),
+    ("usosvc", "windows:update", "Windows Update and Store"),
+    ("bits", "windows:update", "Windows Update and Store"),
+    (
+        "installservice",
+        "windows:update",
+        "Windows Update and Store",
+    ),
+    ("windefend", "windows:defender", "Microsoft Defender"),
+    ("mdcoresvc", "windows:defender", "Microsoft Defender"),
+    ("wdnissvc", "windows:defender", "Microsoft Defender"),
+];
+
+/// Descriptions that don't name an app: Electron's and Chromium's defaults, and words
+/// many programs use.
+const VAGUE_NAMES: &[&str] = &[
+    "electron",
+    "chromium",
+    "application",
+    "app",
+    "updater",
+    "update",
+    "setup",
+    "installer",
+    "launcher",
+    "helper",
+    "service",
+];
+
+/// Names DataSabi gives its own rows. A program's description is chosen by its
+/// author, so one claiming any of these (or starting with one) could hide its data
+/// under a trusted-looking row.
+const RESERVED_NAMES: &[&str] = &[
+    "windows update and store",
+    "microsoft defender",
+    "windows (system)",
+    "windows services",
+    "other (windows)",
+    "unknown",
+];
+
+/// The most a program's version information may declare (real ones are a few KB); a
+/// crafted file could declare far more, and the service runs as LocalSystem.
+pub const MAX_VERSION_INFO: u32 = 1024 * 1024;
+
+/// Whether a declared version-information size is worth reading.
+pub fn version_info_size_ok(size: u32) -> bool {
+    size > 0 && size <= MAX_VERSION_INFO
+}
+
+/// Characters that show nothing (format and invisible characters, Unicode's
+/// "Default_Ignorable" set and the bidi marks): a name could hide them inside a word.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Characters that show as a gap: every Unicode space (no-break, thin, ideographic…)
+/// and the blank fillers that look like one.
+fn is_blank(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '\u{115F}' | '\u{1160}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}'
+        )
+}
+
+/// Text from a program or service as it would look on screen, so it can be compared:
+/// invisible and control characters removed, every kind of gap made one plain space,
+/// and no spaces at either end. "Windows" + no-break space + "Update", or a word
+/// joiner hidden inside a word, then reads exactly like the plain text.
+fn clean_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in text.chars() {
+        if is_blank(c) {
+            gap = true;
+        } else if !(c.is_control() || is_invisible(c)) {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A friendly name from a program or service, if it names something: cleaned of
+/// invisible characters; not empty, not the file name itself (`tool.exe`), not a vague
+/// word, not one of DataSabi's own row names, and no longer than a name should be.
+/// "Discord" for `Discord.exe` is kept: it's the app's name without `.exe`.
+fn good_name(text: Option<&str>, file: &str) -> Option<String> {
+    let t = clean_text(text?);
+    let lower = t.to_lowercase();
+    let vague = t.is_empty()
+        || lower == file.to_lowercase()
+        || VAGUE_NAMES.contains(&lower.as_str())
+        || RESERVED_NAMES.iter().any(|r| lower.starts_with(r))
+        // Windows' own programs give this as their product name: not an app.
+        || lower.contains("operating system")
+        || t.chars().count() > 64;
+    (!vague).then_some(t)
+}
+
+/// A Store (MSIX) app's package from its install folder,
+/// `<store_root>\<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>\…`, where
+/// `store_root` is the real `%ProgramFiles%\WindowsApps` (only Windows can write
+/// there; a folder of that name anywhere else could be anyone's). Returns its family
+/// name (`<Name>_<PublisherId>`, the same across updates) and its short name (the part
+/// of `<Name>` after the publisher's prefix, `Microsoft.WindowsTerminal` →
+/// `WindowsTerminal`).
+fn store_package(image: &str, store_root: Option<&Path>) -> Option<(String, String)> {
+    let root = store_root?;
+    let path = Path::new(image);
+    if !is_inside(path, root) {
+        return None;
+    }
+    let folder = path.components().nth(root.components().count())?;
+    let fields: Vec<&str> = folder.as_os_str().to_str()?.split('_').collect();
+    let [name, version, _arch, _resource, publisher] = fields.as_slice() else {
+        return None;
+    };
+    if name.is_empty() || publisher.is_empty() || !is_version(version) {
+        return None;
+    }
+    let short = name.rsplit('.').next().unwrap_or(name);
+    Some((format!("{name}_{publisher}"), short.to_string()))
+}
+
+/// A svchost's app from the services it runs. One known group (all of Windows Update's
+/// services, say) or a single service: that app, by its friendly name. Several unrelated
+/// services sharing one process (PCs under about 3.5 GB of RAM, B3): one app for that
+/// mix, named after Windows Update if it's among them, otherwise after the first few.
+fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
+    let mut apps: Vec<(String, String)> = services
+        .iter()
+        .map(|s| {
+            let lower = s.name.to_ascii_lowercase();
+            match SERVICE_GROUPS.iter().find(|(svc, _, _)| *svc == lower) {
+                Some((_, key, name)) => (key.to_string(), name.to_string()),
+                None => {
+                    let shown =
+                        good_name(Some(&s.display), &s.name).unwrap_or_else(|| clean_text(&s.name));
+                    (format!("svc:{lower}"), shown)
+                }
+            }
+        })
+        .collect();
+    apps.sort();
+    apps.dedup();
+    if let [(key, name)] = apps.as_slice() {
+        return AppInfo {
+            key: key.clone(),
+            name: name.clone(),
+            exe: Some(image.to_string()),
+        };
+    }
+    let mut names: Vec<String> = services
+        .iter()
+        .map(|s| s.name.to_ascii_lowercase())
+        .collect();
+    names.sort_unstable();
+    // PCs under about 3.5 GB of RAM put the update services in a shared process with
+    // others (B3). Updates are what people suspect most, so they stay recognisable.
+    if apps.iter().any(|(key, _)| key == "windows:update") {
+        return AppInfo {
+            key: format!("svchost:{}", names.join(",")),
+            name: "Windows Update and Store (with other services)".into(),
+            exe: Some(image.to_string()),
+        };
+    }
+    let mut shown: Vec<&str> = apps.iter().map(|(_, n)| n.as_str()).collect();
+    shown.sort_unstable_by_key(|n| n.to_lowercase());
+    shown.dedup();
+    let name = match shown.as_slice() {
+        [a, b] => format!("Windows services ({a}, {b})"),
+        [a, b, rest @ ..] => format!("Windows services ({a}, {b} and {} more)", rest.len()),
+        _ => "Windows services".to_string(),
+    };
+    AppInfo {
+        key: format!("svchost:{}", names.join(",")),
+        name,
+        exe: Some(image.to_string()),
+    }
+}
+
+/// An app's identity from its process: the kernel, a svchost by the services it runs, a
+/// Store app by its package, or a program by its file; named by what its file says
+/// about itself (`files`, its version information) where that names something.
 ///
 /// Programs are keyed by **file name**, not full path as on Linux: Windows apps often
 /// update into new version folders (Squirrel's `app-1.0.9`, Chrome's and WebView2's
 /// version folders), and a path key would make each update a new app with its history
 /// split. Generic file names ([`GENERIC_FILES`], e.g. `updater.exe`) would merge
 /// different vendors, so they're keyed with their vendor or product folder
-/// (`exe:<folder>\<file>`, the nearest folder that isn't a version or a root). Friendly
-/// names (file descriptions, "Windows Update and Store") come in a later PR; until then
-/// the file name is shown, with the folder for generic ones.
-pub fn app_info(pid: u32, image: Option<&str>, services: &[String]) -> AppInfo {
+/// (`exe:<folder>\<file>`, the nearest folder that isn't a version or a root). Store
+/// apps (only under `store_root`, the real `%ProgramFiles%\WindowsApps`) are keyed by
+/// their package family (`pkg:<family>`): their folder carries the version, and one
+/// package's programs are one app. Only the name changes when a better one is found;
+/// the key, and so the history, stays. Known limit: any program with a given file name
+/// counts as the same app wherever it lives (see the README).
+pub fn app_info(
+    pid: u32,
+    image: Option<&str>,
+    services: &[Service],
+    files: Option<&FileNames>,
+    store_root: Option<&Path>,
+) -> AppInfo {
     if pid == SYSTEM_PID {
         return AppInfo {
             key: "windows:system".into(),
@@ -182,12 +417,15 @@ pub fn app_info(pid: u32, image: Option<&str>, services: &[String]) -> AppInfo {
     let file = image.rsplit(['\\', '/']).next().unwrap_or(image);
     let lower = file.to_ascii_lowercase();
     if lower == "svchost.exe" && !services.is_empty() {
-        let mut s = services.to_vec();
-        s.sort_unstable_by_key(|x| x.to_ascii_lowercase());
-        let list = s.join(",");
+        return svchost_info(image, services);
+    }
+    let friendly = files.and_then(|f| {
+        good_name(f.description.as_deref(), file).or_else(|| good_name(f.product.as_deref(), file))
+    });
+    if let Some((family, short)) = store_package(image, store_root) {
         return AppInfo {
-            key: format!("svchost:{}", list.to_ascii_lowercase()),
-            name: format!("svchost.exe [{list}]"),
+            key: format!("pkg:{}", family.to_ascii_lowercase()),
+            name: friendly.unwrap_or(short),
             exe: Some(image.to_string()),
         };
     }
@@ -195,14 +433,14 @@ pub fn app_info(pid: u32, image: Option<&str>, services: &[String]) -> AppInfo {
         if let Some(folder) = app_folder(image) {
             return AppInfo {
                 key: format!("exe:{}\\{lower}", folder.to_ascii_lowercase()),
-                name: format!("{file} ({folder})"),
+                name: friendly.unwrap_or_else(|| format!("{file} ({folder})")),
                 exe: Some(image.to_string()),
             };
         }
     }
     AppInfo {
         key: format!("exe:{lower}"),
-        name: file.to_string(),
+        name: friendly.unwrap_or_else(|| file.to_string()),
         exe: Some(image.to_string()),
     }
 }
@@ -518,8 +756,18 @@ fn percent(bytes: u64, pct: u64) -> u64 {
 }
 
 /// Whether `path` is inside `dir` (both canonical, from `std::fs::canonicalize`),
-/// ignoring case as Windows does. `dir` itself is not "inside".
+/// ignoring case as Windows does. `dir` itself is not "inside", and a path with `.` or
+/// `..` in it never is.
 pub fn is_inside(path: &Path, dir: &Path) -> bool {
+    // `..` could point out of `dir` while the text looks inside it; real (canonical or
+    // process) paths never have these, so a path that does is refused.
+    let odd = |p: &Path| {
+        p.components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    };
+    if odd(path) || odd(dir) {
+        return false;
+    }
     let lower = |p: &Path| -> Vec<String> {
         p.components()
             .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
@@ -550,6 +798,20 @@ pub fn aside_name(path: &Path, unix: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service(name: &str, display: &str) -> Service {
+        Service {
+            name: name.into(),
+            display: display.into(),
+        }
+    }
+
+    fn described(description: &str) -> FileNames {
+        FileNames {
+            description: Some(description.into()),
+            product: None,
+        }
+    }
 
     #[test]
     fn sends_are_uploads_and_receives_downloads() {
@@ -620,23 +882,301 @@ mod tests {
             1234,
             Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
             &[],
+            None,
+            None,
         );
         assert_eq!(chrome.key, "exe:chrome.exe");
         assert_eq!(chrome.name, "chrome.exe");
         // The same program from another folder is the same app.
-        let other = app_info(9, Some(r"D:\Apps\CHROME.EXE"), &[]);
+        let other = app_info(9, Some(r"D:\Apps\CHROME.EXE"), &[], None, None);
         assert_eq!(other.key, "exe:chrome.exe");
         // A svchost is known by the services it runs, in a stable order.
         let svc = app_info(
             800,
             Some(r"C:\Windows\System32\svchost.exe"),
-            &["wuauserv".into(), "DoSvc".into()],
+            &[service("Dnscache", "DNS Client")],
+            None,
+            None,
         );
-        assert_eq!(svc.key, "svchost:dosvc,wuauserv");
-        assert_eq!(svc.name, "svchost.exe [DoSvc,wuauserv]");
-        assert_eq!(app_info(4, None, &[]).name, "Windows (system)");
-        assert_eq!(app_info(77, None, &[]), AppInfo::unknown());
-        assert_eq!(app_info(77, Some(""), &[]), AppInfo::unknown());
+        assert_eq!(svc.key, "svc:dnscache");
+        assert_eq!(svc.name, "DNS Client");
+        assert_eq!(app_info(4, None, &[], None, None).name, "Windows (system)");
+        assert_eq!(app_info(77, None, &[], None, None), AppInfo::unknown());
+        assert_eq!(app_info(77, Some(""), &[], None, None), AppInfo::unknown());
+    }
+
+    #[test]
+    fn windows_update_and_store_is_one_app() {
+        let svchost = r"C:\Windows\System32\svchost.exe";
+        let info = |pid, services: &[Service]| app_info(pid, Some(svchost), services, None, None);
+        // Delivery Optimization on its own (B3), and the others: the same app.
+        let dosvc = info(10, &[service("DoSvc", "Delivery Optimization")]);
+        let wu = info(
+            11,
+            &[
+                service("wuauserv", "Windows Update"),
+                service("BITS", "Background Intelligent Transfer Service"),
+            ],
+        );
+        assert_eq!(dosvc.key, "windows:update");
+        assert_eq!(dosvc.name, "Windows Update and Store");
+        assert_eq!((wu.key, wu.name), (dosvc.key.clone(), dosvc.name.clone()));
+        // Defender's services: one app too.
+        let defender = info(
+            12,
+            &[service("WinDefend", "Microsoft Defender Antivirus Service")],
+        );
+        assert_eq!(
+            (defender.key.as_str(), defender.name.as_str()),
+            ("windows:defender", "Microsoft Defender")
+        );
+    }
+
+    #[test]
+    fn a_shared_svchost_is_named_after_its_services() {
+        let svchost = r"C:\Windows\System32\svchost.exe";
+        let info = |pid, services: &[Service]| app_info(pid, Some(svchost), services, None, None);
+        // Low RAM: the update services share a process with others (B3). Updates stay
+        // recognisable; the key is that mix.
+        let shared = info(
+            20,
+            &[
+                service("wuauserv", "Windows Update"),
+                service("Schedule", "Task Scheduler"),
+                service("Themes", "Themes"),
+            ],
+        );
+        assert_eq!(shared.key, "svchost:schedule,themes,wuauserv");
+        assert_eq!(
+            shared.name,
+            "Windows Update and Store (with other services)"
+        );
+        // Without them: named after the first few.
+        let others = info(
+            21,
+            &[
+                service("Schedule", "Task Scheduler"),
+                service("Themes", "Themes"),
+                service("Winmgmt", "Windows Management Instrumentation"),
+                service("Dnscache", "DNS Client"),
+            ],
+        );
+        assert_eq!(others.key, "svchost:dnscache,schedule,themes,winmgmt");
+        assert_eq!(
+            others.name,
+            "Windows services (DNS Client, Task Scheduler and 2 more)"
+        );
+        // No display name: the service's own name. Order doesn't matter.
+        let two = info(22, &[service("Dnscache", "DNS Client"), service("nsi", "")]);
+        assert_eq!(two.name, "Windows services (DNS Client, nsi)");
+        let again = info(23, &[service("nsi", ""), service("Dnscache", "DNS Client")]);
+        assert_eq!(two.key, again.key);
+        // A service's display name can't claim one of our rows either.
+        let spoof = info(24, &[service("EvilSvc", "Windows Update and Store")]);
+        assert_eq!(
+            (spoof.key.as_str(), spoof.name.as_str()),
+            ("svc:evilsvc", "EvilSvc")
+        );
+    }
+
+    #[test]
+    fn programs_are_named_by_their_description() {
+        let info = |pid, image: &str, files: &FileNames| {
+            app_info(pid, Some(image), &[], Some(files), None)
+        };
+        let chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        let named = info(30, chrome, &described("Google Chrome"));
+        assert_eq!(named.name, "Google Chrome");
+        // The name changes, the key (and so the history) doesn't.
+        assert_eq!(named.key, app_info(31, Some(chrome), &[], None, None).key);
+        // Vague or missing descriptions fall back: product name, then the file.
+        let electron = FileNames {
+            description: Some("Electron".into()),
+            product: Some("Signal".into()),
+        };
+        assert_eq!(
+            info(32, r"C:\Apps\Signal\Signal.exe", &electron).name,
+            "Signal"
+        );
+        let windows = FileNames {
+            description: Some("  ".into()),
+            product: Some("Microsoft® Windows® Operating System".into()),
+        };
+        assert_eq!(
+            info(33, r"C:\Windows\System32\curl.exe", &windows).name,
+            "curl.exe"
+        );
+        assert_eq!(
+            info(35, r"C:\Tools\tool.exe", &described("tool.exe")).name,
+            "tool.exe"
+        );
+        // Generic files keep their folder key; a real description names them.
+        let ff = r"C:\Program Files\Mozilla Firefox\updater.exe";
+        let updater = info(36, ff, &described("Firefox Software Updater"));
+        assert_eq!(updater.key, r"exe:mozilla firefox\updater.exe");
+        assert_eq!(updater.name, "Firefox Software Updater");
+        let squirrel = info(
+            37,
+            r"C:\Users\a\AppData\Local\Discord\Update.exe",
+            &described("Update"),
+        );
+        assert_eq!(squirrel.name, "Update.exe (Discord)");
+    }
+
+    #[test]
+    fn a_program_cant_take_one_of_our_names() {
+        let info = |files: &FileNames| {
+            app_info(
+                50,
+                Some(r"C:\Users\a\Downloads\x.exe"),
+                &[],
+                Some(files),
+                None,
+            )
+        };
+        for claim in [
+            "Windows Update and Store",
+            "windows update and store helper",
+            "MICROSOFT DEFENDER",
+            "Windows (system)",
+            "Windows services (DNS Client)",
+            "Other (Windows)",
+            "Unknown / system",
+        ] {
+            assert_eq!(info(&described(claim)).name, "x.exe", "{claim}");
+        }
+        // Hidden characters can't get round it, and are removed from names that pass.
+        assert_eq!(
+            info(&described("\u{200E}Windows Update and Store")).name,
+            "x.exe"
+        );
+        assert_eq!(
+            info(&described("Windows\u{0007} Update and Store")).name,
+            "x.exe"
+        );
+        assert_eq!(
+            info(&described("Good\u{202E}App\u{2066}\u{FEFF}")).name,
+            "GoodApp"
+        );
+        assert_eq!(info(&described("\u{202E}\u{200B}")).name, "x.exe");
+        // Look-alike gaps and joiners: each displays as "Windows Update and Store".
+        for spoof in [
+            "Windows\u{00A0}Update and Store",
+            "Windows\u{2009}Update\u{3000}and Store",
+            "Windows\u{2800}Update and Store",
+            "Win\u{2060}dows Update and Store",
+            "Win\u{00AD}dows Update and Store",
+            "Windows Up\u{E0041}date and Store",
+            "Windows Update\u{180E} and\u{FE0F} Store",
+            "  Windows \t Update   and Store ",
+        ] {
+            assert_eq!(info(&described(spoof)).name, "x.exe", "{spoof:?}");
+        }
+        // A real name keeps its words, with gaps made single plain spaces.
+        assert_eq!(
+            info(&described("Visual  Studio\u{00A0}Code")).name,
+            "Visual Studio Code"
+        );
+    }
+
+    #[test]
+    fn oversized_version_information_isnt_read() {
+        assert!(version_info_size_ok(4 * 1024));
+        assert!(version_info_size_ok(MAX_VERSION_INFO));
+        assert!(!version_info_size_ok(MAX_VERSION_INFO + 1));
+        assert!(!version_info_size_ok(u32::MAX));
+        assert!(!version_info_size_ok(0));
+    }
+
+    /// A Windows path in this platform's form (`\` separates only on Windows).
+    fn native(path: &str) -> String {
+        if cfg!(windows) {
+            path.to_string()
+        } else {
+            path.replace('\\', "/")
+        }
+    }
+
+    #[test]
+    fn store_apps_are_one_app_across_updates() {
+        let root = native(r"C:\Program Files\WindowsApps");
+        let store = Some(Path::new(&root));
+        let info = |pid, image: &str, files: Option<&FileNames>| {
+            app_info(pid, Some(&native(image)), &[], files, store)
+        };
+        let v1 = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.19.10573.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe";
+        let v2 = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.20.11271.0_x64__8wekyb3d8bbwe\OpenConsole.exe";
+        let a = info(40, v1, Some(&described("Windows Terminal")));
+        let b = info(41, v2, None);
+        assert_eq!(a.key, "pkg:microsoft.windowsterminal_8wekyb3d8bbwe");
+        assert_eq!(a.key, b.key);
+        assert_eq!(a.name, "Windows Terminal");
+        // No description: the package's short name.
+        assert_eq!(b.name, "WindowsTerminal");
+        // Case doesn't matter, as on Windows.
+        let lower = r"c:\program files\windowsapps\Microsoft.WindowsTerminal_1.19.10573.0_x64__8wekyb3d8bbwe\x.exe";
+        assert_eq!(info(42, lower, None).key, a.key);
+        // A generic file inside a package is still the package's app.
+        let generic = r"C:\Program Files\WindowsApps\SpotifyAB.SpotifyMusic_1.250.0.0_x86__zpdnekdrzrea0\app\updater.exe";
+        assert_eq!(
+            info(43, generic, None).key,
+            "pkg:spotifyab.spotifymusic_zpdnekdrzrea0"
+        );
+        // Not a package folder: the usual rules.
+        assert_eq!(
+            info(44, r"C:\Program Files\WindowsApps\loose.exe", None).key,
+            "exe:loose.exe"
+        );
+        assert_eq!(
+            info(45, r"C:\Program Files\WindowsApps\Odd_Folder\x.exe", None).key,
+            "exe:x.exe"
+        );
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_isnt_inside() {
+        let root = native(r"C:\Program Files\WindowsApps");
+        let store = Some(Path::new(&root));
+        // Text inside the Store folder, but `..` leads back out of it.
+        let climb = native(r"C:\Program Files\WindowsApps\Pkg_1.0_x64__pub\..\..\x.exe");
+        assert_eq!(
+            app_info(70, Some(&climb), &[], None, store).key,
+            "exe:x.exe"
+        );
+        let pf = Path::new("/pf/Program Files");
+        assert!(!is_inside(Path::new("/pf/Program Files/../Users/x"), pf));
+        assert!(!is_inside(
+            Path::new("/pf/Program Files/a/x"),
+            Path::new("/pf/Program Files/../Program Files")
+        ));
+        // The same package folder without the climb is a package.
+        let plain = native(r"C:\Program Files\WindowsApps\Pkg_1.0_x64__pub\x.exe");
+        assert_eq!(
+            app_info(71, Some(&plain), &[], None, store).key,
+            "pkg:pkg_pub"
+        );
+    }
+
+    #[test]
+    fn a_folder_named_windowsapps_elsewhere_isnt_the_store() {
+        let root = native(r"C:\Program Files\WindowsApps");
+        let store = Some(Path::new(&root));
+        // Anyone can make this folder; the program must not hide inside Spotify.
+        let fake = native(
+            r"C:\Users\a\Downloads\WindowsApps\SpotifyAB.SpotifyMusic_1.2.3.0_x64__zpdnekdrzrea0\x.exe",
+        );
+        let info = app_info(60, Some(&fake), &[], None, store);
+        assert_eq!(info.key, "exe:x.exe");
+        // A look-alike next to the real one doesn't count either.
+        let near = native(
+            r"C:\Program Files\WindowsAppsX\SpotifyAB.SpotifyMusic_1.2.3.0_x64__zpdnekdrzrea0\x.exe",
+        );
+        assert_eq!(app_info(61, Some(&near), &[], None, store).key, "exe:x.exe");
+        // Without the real folder's location, nothing is a Store app.
+        let real = native(
+            r"C:\Program Files\WindowsApps\SpotifyAB.SpotifyMusic_1.2.3.0_x64__zpdnekdrzrea0\x.exe",
+        );
+        assert_eq!(app_info(62, Some(&real), &[], None, None).key, "exe:x.exe");
     }
 
     #[test]
@@ -645,11 +1185,15 @@ mod tests {
             1,
             Some(r"C:\Program Files\Google\Chrome\Application\130.0.6723.70\chrome.exe"),
             &[],
+            None,
+            None,
         );
         let b = app_info(
             2,
             Some(r"C:\Program Files\Google\Chrome\Application\131.0.6778.86\chrome.exe"),
             &[],
+            None,
+            None,
         );
         assert_eq!(a.key, b.key);
         assert_eq!(a.key, "exe:chrome.exe");
@@ -661,11 +1205,15 @@ mod tests {
             101,
             Some(r"C:\Program Files\Mozilla Firefox\updater.exe"),
             &[],
+            None,
+            None,
         );
         let vendor = app_info(
             102,
             Some(r"C:\Program Files\Acme\Tool\2.4.1\updater.exe"),
             &[],
+            None,
+            None,
         );
         assert_eq!(firefox.key, r"exe:mozilla firefox\updater.exe");
         assert_eq!(firefox.name, "updater.exe (Mozilla Firefox)");
@@ -677,17 +1225,21 @@ mod tests {
             103,
             Some(r"C:\Users\a\AppData\Local\Discord\Update.exe"),
             &[],
+            None,
+            None,
         );
         assert_eq!(discord.key, r"exe:discord\update.exe");
         let slack = app_info(
             104,
             Some(r"C:\Users\a\AppData\Local\Slack\app-4.41.97\Update.exe"),
             &[],
+            None,
+            None,
         );
         assert_eq!(slack.key, r"exe:slack\update.exe");
         // Straight under a root: nothing to name it by, so the file alone.
         assert_eq!(
-            app_info(105, Some(r"C:\Program Files\setup.exe"), &[]).key,
+            app_info(105, Some(r"C:\Program Files\setup.exe"), &[], None, None).key,
             "exe:setup.exe"
         );
     }
