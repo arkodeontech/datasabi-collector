@@ -3,6 +3,7 @@
 //! The Windows counterpart of `linux/`.
 
 pub mod adapters;
+pub mod datadir;
 pub mod etw;
 pub mod procs;
 pub mod profiles;

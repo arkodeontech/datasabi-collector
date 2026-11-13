@@ -123,9 +123,17 @@ pub struct Listener {
 }
 
 /// Creates the pipe's first instance. Fails if the name is already taken. Must run
-/// inside a Tokio runtime.
-pub fn bind(name: &str) -> Result<Listener> {
-    let sd = SecurityDescriptor::from_sddl(PIPE_SDDL)?;
+/// inside a Tokio runtime. `owner_system`: the service (LocalSystem) names SYSTEM as
+/// the pipe's owner, which clients check. Without it Windows gives objects a
+/// LocalSystem process creates the owner Administrators. Only SYSTEM can set it, so a
+/// collector run by hand passes `false`.
+pub fn bind(name: &str, owner_system: bool) -> Result<Listener> {
+    let sddl = if owner_system {
+        format!("O:SY{PIPE_SDDL}")
+    } else {
+        PIPE_SDDL.to_string()
+    };
+    let sd = SecurityDescriptor::from_sddl(&sddl)?;
     let next = create(name, true, &sd)?;
     tracing::info!("listening on {name}");
     Ok(Listener {
@@ -248,6 +256,7 @@ mod tests {
     #[test]
     fn the_access_list_builds_and_bad_sddl_is_refused() {
         assert!(SecurityDescriptor::from_sddl(PIPE_SDDL).is_ok());
+        assert!(SecurityDescriptor::from_sddl(&format!("O:SY{PIPE_SDDL}")).is_ok());
         assert!(SecurityDescriptor::from_sddl("not an access list").is_err());
     }
 
@@ -257,7 +266,7 @@ mod tests {
     async fn clients_are_answered_over_the_pipe() {
         let (_dir, shared) = shared();
         let name = unique_name();
-        let listener = bind(&name).unwrap();
+        let listener = bind(&name, false).unwrap();
         tokio::spawn(serve(listener, shared));
         let a = connect(&name).await;
         let b = connect(&name).await;
@@ -277,7 +286,7 @@ mod tests {
     async fn a_client_with_only_read_and_write_data_is_answered() {
         let (_dir, shared) = shared();
         let name = unique_name();
-        let listener = bind(&name).unwrap();
+        let listener = bind(&name, false).unwrap();
         tokio::spawn(serve(listener, shared));
         let pipe_name = name.clone();
         let line = tokio::task::spawn_blocking(move || {
@@ -315,7 +324,7 @@ mod tests {
     async fn clients_that_leave_at_once_dont_stop_the_server() {
         let (_dir, shared) = shared();
         let name = unique_name();
-        let listener = bind(&name).unwrap();
+        let listener = bind(&name, false).unwrap();
         tokio::spawn(serve(listener, shared));
         for _ in 0..20 {
             drop(connect(&name).await);
@@ -328,9 +337,9 @@ mod tests {
     #[tokio::test]
     async fn a_taken_name_is_refused() {
         let name = unique_name();
-        let _first = bind(&name).unwrap();
+        let _first = bind(&name, false).unwrap();
         // `Listener` has no Debug, so no `expect_err`.
-        match bind(&name) {
+        match bind(&name, false) {
             Ok(_) => panic!("a second first instance must fail"),
             Err(err) => assert!(format!("{err:#}").contains("already using it")),
         }

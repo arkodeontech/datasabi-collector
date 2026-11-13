@@ -5,7 +5,7 @@
 //! network events need administrator rights (least privilege is checked in D3).
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -21,14 +21,9 @@ use windows_service::service_control_handler::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-use windows_sys::Win32::Security::{
-    GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-};
 
+use super::datadir;
 use crate::config::{data_dir, Config};
-use crate::ipc::pipe::SecurityDescriptor;
 use crate::rolling::RollingFile;
 use crate::winrules::{is_inside, plain_drive_path};
 
@@ -37,12 +32,13 @@ pub const SERVICE_NAME: &str = "DataSabiCollector";
 const DISPLAY_NAME: &str = "DataSabi service";
 const DESCRIPTION: &str = "Measures how much internet data each app uses, for the DataSabi \
                            app. Nothing is sent over the internet.";
-/// The data folder (`%ProgramData%\DataSabi`: the usage history and the logs): SYSTEM
-/// and Administrators only, inherited by everything inside (`OICI`), nothing inherited
-/// from above (`P`).
-const DATA_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const LOG_KEEP: usize = 3;
+/// The service's exit codes (shown by `sc query DataSabiCollector`, and in the System
+/// event log), so a failure before the log file is open still says what went wrong.
+const EXIT_RUNNING: u32 = 1;
+const EXIT_DATA_FOLDER: u32 = 2;
+const EXIT_LOG_FILE: u32 = 3;
 /// How long Windows is told to wait while the service stops (ETW session, last flush).
 const STOP_WAIT: Duration = Duration::from_secs(20);
 
@@ -124,14 +120,16 @@ fn run_service() -> Result<()> {
     let _ = handle_cell.set(handle);
 
     let result = serve(handle, stop_rx);
-    if let Err(e) = &result {
-        tracing::error!("stopping after an error: {e:#}");
+    if let Err((code, e)) = &result {
+        // Also to stderr: the log file may be what failed.
+        eprintln!("DataSabi service stopping (code {code}): {e:#}");
+        tracing::error!("stopping after an error (code {code}): {e:#}");
     }
     // Always tell Windows it stopped; a non-zero exit code makes it apply the recovery
     // actions (restart).
     let exit = match result {
         Ok(()) => ServiceExitCode::NO_ERROR,
-        Err(_) => ServiceExitCode::ServiceSpecific(1),
+        Err((code, _)) => ServiceExitCode::ServiceSpecific(code),
     };
     handle
         .set_service_status(status(
@@ -143,21 +141,32 @@ fn run_service() -> Result<()> {
     Ok(())
 }
 
-fn serve(handle: ServiceStatusHandle, stop_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-    prepare_data_dir()?;
-    init_file_logging()?;
-    handle
-        .set_service_status(status(
-            ServiceState::Running,
-            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            ServiceExitCode::NO_ERROR,
-        ))
-        .context("reporting the service running")?;
-    // As installed: no options, so the defaults (the pipe, the database in the data folder).
-    let cfg = Config::parse_from(["datasabi-collector"]);
-    crate::serve_windows(cfg, async {
-        let _ = stop_rx.await;
-    })
+/// Runs until stopped; an error comes with its exit code.
+fn serve(
+    handle: ServiceStatusHandle,
+    stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> std::result::Result<(), (u32, anyhow::Error)> {
+    let moved = datadir::prepare(LOG_KEEP).map_err(|e| (EXIT_DATA_FOLDER, e))?;
+    init_file_logging().map_err(|e| (EXIT_LOG_FILE, e))?;
+    for path in moved {
+        tracing::warn!("moved an untrusted {} aside", path.display());
+    }
+    let running = || -> Result<()> {
+        handle
+            .set_service_status(status(
+                ServiceState::Running,
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                ServiceExitCode::NO_ERROR,
+            ))
+            .context("reporting the service running")?;
+        // As installed: no options, so the defaults (the pipe, the database in the
+        // data folder).
+        let cfg = Config::parse_from(["datasabi-collector"]);
+        crate::serve_windows(cfg, true, async {
+            let _ = stop_rx.await;
+        })
+    };
+    running().map_err(|e| (EXIT_RUNNING, e))
 }
 
 /// Logs to `%ProgramData%\DataSabi\logs\collector.log`, rolled over at 5 MB, 3 kept.
@@ -177,52 +186,6 @@ fn init_file_logging() -> Result<()> {
         .with_ansi(false)
         .with_writer(Mutex::new(file))
         .init();
-    Ok(())
-}
-
-/// Creates the data folder and gives it its access list ([`DATA_SDDL`]), also on an
-/// existing folder (the collector may have been run by hand before).
-fn prepare_data_dir() -> Result<()> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    set_dacl(&dir, DATA_SDDL)
-}
-
-fn set_dacl(path: &Path, sddl: &str) -> Result<()> {
-    let sd = SecurityDescriptor::from_sddl(sddl)?;
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: `sd` is a valid descriptor; `dacl` points into it and is used while it lives.
-    let ok =
-        unsafe { GetSecurityDescriptorDacl(sd.as_ptr(), &mut present, &mut dacl, &mut defaulted) };
-    if ok == 0 || present == 0 {
-        bail!("the access list for {} has no DACL", path.display());
-    }
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
-    // SAFETY: `wide` is NUL-terminated; `dacl` is valid while `sd` lives (to the end).
-    let err = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null(),
-        )
-    };
-    if err != ERROR_SUCCESS {
-        bail!(
-            "setting the access list on {} failed (Windows error {err})",
-            path.display()
-        );
-    }
     Ok(())
 }
 
@@ -311,7 +274,9 @@ fn install(dev: bool) -> Result<()> {
     service
         .set_failure_actions_on_non_crash_failures(true)
         .context("setting restart on error exits")?;
-    prepare_data_dir()?;
+    for path in datadir::prepare(LOG_KEEP)? {
+        println!("Moved an untrusted {} aside.", path.display());
+    }
     let state = service
         .query_status()
         .context("querying the service")?

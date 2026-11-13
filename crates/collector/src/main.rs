@@ -55,7 +55,7 @@ fn run(_cfg: Config) -> Result<()> {
 /// service instead (`windows::service`).
 #[cfg(windows)]
 fn run(cfg: Config) -> Result<()> {
-    serve_windows(cfg, async {
+    serve_windows(cfg, false, async {
         let _ = tokio::signal::ctrl_c().await;
     })
 }
@@ -64,7 +64,11 @@ fn run(cfg: Config) -> Result<()> {
 /// until `stop` completes; then the capture stops its ETW session and the engine
 /// flushes its last counts (`windows::run`).
 #[cfg(windows)]
-pub fn serve_windows(cfg: Config, stop: impl std::future::Future<Output = ()>) -> Result<()> {
+pub fn serve_windows(
+    cfg: Config,
+    as_service: bool,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -91,7 +95,7 @@ pub fn serve_windows(cfg: Config, stop: impl std::future::Future<Output = ()>) -
 
     let name = cfg.socket.to_string_lossy().into_owned();
     let result = rt.block_on(async {
-        let listener = ipc::pipe::bind(&name)?;
+        let listener = ipc::pipe::bind(&name, as_service)?;
         tokio::select! {
             r = ipc::pipe::serve(listener, shared.clone()) => r,
             r = done_rx => match r {

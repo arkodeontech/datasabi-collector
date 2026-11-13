@@ -540,6 +540,13 @@ pub fn plain_drive_path(canonical: &Path) -> Option<PathBuf> {
     drive.then(|| PathBuf::from(rest))
 }
 
+/// Where an untrusted file or folder is moved: `<name>.untrusted-<unix time>`, next to it.
+pub fn aside_name(path: &Path, unix: u64) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".untrusted-{unix}"));
+    path.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,18 +1004,56 @@ mod tests {
         assert!(!is_inside(Path::new("/pf/Users/a/Downloads/x"), pf));
         // A sibling whose name only starts the same is not inside.
         assert!(!is_inside(Path::new("/pf/Program Files Evil/x"), pf));
-        // The real shape on Windows (`\` separates only there).
-        if cfg!(windows) {
-            let pf = Path::new(r"\\?\C:\Program Files");
-            assert!(is_inside(
-                Path::new(r"\\?\c:\program files\DataSabi\x.exe"),
-                pf
-            ));
-            assert!(!is_inside(
-                Path::new(r"\\?\C:\Program Files Evil\x.exe"),
-                pf
-            ));
-        }
+    }
+
+    /// The real shapes, where `\` separates (Windows CI).
+    #[cfg(windows)]
+    #[test]
+    fn program_files_rule_with_windows_paths() {
+        let pf = Path::new(r"\\?\C:\Program Files");
+        assert!(is_inside(
+            Path::new(r"\\?\C:\Program Files\DataSabi\datasabi-collector.exe"),
+            pf
+        ));
+        // Case differences, as Windows ignores them.
+        assert!(is_inside(
+            Path::new(r"\\?\c:\PROGRAM FILES\datasabi\X.EXE"),
+            pf
+        ));
+        assert!(is_inside(
+            Path::new(r"\\?\C:\Program Files\x.exe"),
+            Path::new(r"\\?\c:\program files")
+        ));
+        // Look-alikes and other places.
+        assert!(!is_inside(
+            Path::new(r"\\?\C:\Program Files Evil\x.exe"),
+            pf
+        ));
+        assert!(!is_inside(Path::new(r"\\?\C:\Program Filesx\x.exe"), pf));
+        assert!(!is_inside(Path::new(r"\\?\D:\Program Files\x.exe"), pf));
+        assert!(!is_inside(Path::new(r"\\?\C:\Users\a\Downloads\x.exe"), pf));
+        assert!(!is_inside(pf, pf));
+        // Without the prefix on both, the same answers.
+        assert!(is_inside(
+            Path::new(r"C:\Program Files\DataSabi\x.exe"),
+            Path::new(r"C:\Program Files")
+        ));
+        assert!(!is_inside(
+            Path::new(r"C:\Program Files Evil\x.exe"),
+            Path::new(r"C:\Program Files")
+        ));
+    }
+
+    #[test]
+    fn untrusted_things_are_moved_next_to_themselves() {
+        assert_eq!(
+            aside_name(Path::new("/data/DataSabi"), 1_763_000_000),
+            PathBuf::from("/data/DataSabi.untrusted-1763000000")
+        );
+        assert_eq!(
+            aside_name(Path::new("/data/DataSabi/logs/collector.log"), 5),
+            PathBuf::from("/data/DataSabi/logs/collector.log.untrusted-5")
+        );
     }
 
     #[test]

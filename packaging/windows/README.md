@@ -20,4 +20,14 @@ allows any folder, with a warning, for tests only.
 
 The Service Control Manager runs it as `datasabi-collector service`. Its data
 (`usage.db`) and logs (`logs\collector.log`, rolled over at 5 MB, 3 kept) are in
-`%ProgramData%\DataSabi`, readable only by SYSTEM and Administrators.
+`%ProgramData%\DataSabi`, owned by Administrators and readable only by SYSTEM
+and Administrators. Any user can create folders in `%ProgramData%`, so a
+`DataSabi` or `logs` folder that is a junction or symlink, or isn't owned by
+SYSTEM or Administrators, is moved aside (`DataSabi.untrusted-<unix time>`) and
+made fresh. The database and log files are moved aside too if they are links,
+have extra hard links, or aren't owned by SYSTEM or Administrators.
+
+If the service stops with an error, its exit code (`sc query DataSabiCollector`,
+`SERVICE_EXIT_CODE`) says where: 1 while running (see the log), 2 the data folder
+couldn't be prepared, 3 the log file couldn't be opened. Codes 2 and 3 happen
+before the log is open.
