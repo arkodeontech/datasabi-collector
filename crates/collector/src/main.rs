@@ -15,6 +15,8 @@ mod engine;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(windows, test))]
+mod rolling;
 mod state;
 mod store;
 #[cfg(windows)]
@@ -28,6 +30,11 @@ use clap::Parser;
 use config::Config;
 
 fn main() -> Result<()> {
+    // Windows: `service` (started by the Service Control Manager), `install`, `uninstall`.
+    #[cfg(windows)]
+    if let Some(r) = windows::service::from_command_line() {
+        return r;
+    }
     let cfg = Config::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -44,10 +51,24 @@ fn run(_cfg: Config) -> Result<()> {
     anyhow::bail!("datasabi-collector supports Linux and Windows only")
 }
 
-/// Windows: the ETW capture on its own thread, the hardened named pipe for the app.
-/// Run as administrator for now; it becomes a Windows service in a later PR.
+/// Windows, run by hand (as administrator): until Ctrl+C. Installed, it runs as a
+/// service instead (`windows::service`).
 #[cfg(windows)]
 fn run(cfg: Config) -> Result<()> {
+    serve_windows(cfg, false, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+/// Windows: the ETW capture on its own thread and the hardened named pipe for the app,
+/// until `stop` completes; then the capture stops its ETW session and the engine
+/// flushes its last counts (`windows::run`).
+#[cfg(windows)]
+pub fn serve_windows(
+    cfg: Config,
+    as_service: bool,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -74,7 +95,7 @@ fn run(cfg: Config) -> Result<()> {
 
     let name = cfg.socket.to_string_lossy().into_owned();
     let result = rt.block_on(async {
-        let listener = ipc::pipe::bind(&name)?;
+        let listener = ipc::pipe::bind(&name, as_service)?;
         tokio::select! {
             r = ipc::pipe::serve(listener, shared.clone()) => r,
             r = done_rx => match r {
@@ -82,7 +103,7 @@ fn run(cfg: Config) -> Result<()> {
                 Ok(Err(e)) => Err(e.context("capture engine failed")),
                 Err(_) => Err(anyhow::anyhow!("capture engine panicked")),
             },
-            _ = tokio::signal::ctrl_c() => {
+            _ = stop => {
                 tracing::info!("shutting down");
                 Ok(())
             }

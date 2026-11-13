@@ -3,13 +3,21 @@ use std::path::PathBuf;
 use clap::Parser;
 use datasabi_protocol::DEFAULT_ENDPOINT;
 
-/// Where the usage history is kept by default.
-#[cfg(not(windows))]
-const DEFAULT_DB: &str = "/var/lib/datasabi/usage.db";
-/// Where the usage history is kept by default (the service PR may move it with
-/// %ProgramData%).
+/// Where the collector keeps its data on Windows: `%ProgramData%\DataSabi` (usually
+/// `C:\ProgramData\DataSabi`), readable only by SYSTEM and Administrators.
 #[cfg(windows)]
-const DEFAULT_DB: &str = r"C:\ProgramData\DataSabi\usage.db";
+pub fn data_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
+    PathBuf::from(base).join("DataSabi")
+}
+
+/// Where the usage history is kept by default.
+fn default_db() -> PathBuf {
+    #[cfg(windows)]
+    return data_dir().join("usage.db");
+    #[cfg(not(windows))]
+    PathBuf::from("/var/lib/datasabi/usage.db")
+}
 
 /// DataSabi collector: measures how much internet data each app uses.
 #[derive(Parser, Debug, Clone)]
@@ -21,7 +29,7 @@ pub struct Config {
     pub socket: PathBuf,
 
     /// SQLite database holding usage history.
-    #[arg(long, default_value = DEFAULT_DB)]
+    #[arg(long, default_value_os_t = default_db())]
     pub db: PathBuf,
 
     /// Group allowed to use the socket (mode 0660). Without it the socket is

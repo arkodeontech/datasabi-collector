@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 
 use datasabi_protocol::Metered;
 
@@ -516,6 +517,36 @@ fn percent(bytes: u64, pct: u64) -> u64 {
     ((u128::from(bytes) * u128::from(pct) + 50) / 100) as u64
 }
 
+/// Whether `path` is inside `dir` (both canonical, from `std::fs::canonicalize`),
+/// ignoring case as Windows does. `dir` itself is not "inside".
+pub fn is_inside(path: &Path, dir: &Path) -> bool {
+    let lower = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let (p, d) = (lower(path), lower(dir));
+    p.len() > d.len() && p.starts_with(&d)
+}
+
+/// A canonical path without the `\\?\` prefix `canonicalize` adds, for places that
+/// expect an ordinary path (the service's command line). Only local drives
+/// (`\\?\C:\…`); anything else (`\\?\UNC\…`) is `None`.
+pub fn plain_drive_path(canonical: &Path) -> Option<PathBuf> {
+    let s = canonical.to_str()?;
+    let rest = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let b = rest.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    drive.then(|| PathBuf::from(rest))
+}
+
+/// Where an untrusted file or folder is moved: `<name>.untrusted-<unix time>`, next to it.
+pub fn aside_name(path: &Path, unix: u64) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".untrusted-{unix}"));
+    path.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,5 +991,85 @@ mod tests {
         assert_eq!(m.extras, vec![(40, 10)]);
         assert_eq!(m.other, (0, 0));
         assert_eq!(m.carry, 0);
+    }
+
+    #[test]
+    fn only_paths_below_program_files_are_inside() {
+        // The rule, with this platform's separators.
+        let pf = Path::new("/pf/Program Files");
+        assert!(is_inside(Path::new("/pf/Program Files/DataSabi/x"), pf));
+        // Windows ignores case.
+        assert!(is_inside(Path::new("/pf/PROGRAM FILES/DataSabi/x"), pf));
+        assert!(!is_inside(pf, pf));
+        assert!(!is_inside(Path::new("/pf/Users/a/Downloads/x"), pf));
+        // A sibling whose name only starts the same is not inside.
+        assert!(!is_inside(Path::new("/pf/Program Files Evil/x"), pf));
+    }
+
+    /// The real shapes, where `\` separates (Windows CI).
+    #[cfg(windows)]
+    #[test]
+    fn program_files_rule_with_windows_paths() {
+        let pf = Path::new(r"\\?\C:\Program Files");
+        assert!(is_inside(
+            Path::new(r"\\?\C:\Program Files\DataSabi\datasabi-collector.exe"),
+            pf
+        ));
+        // Case differences, as Windows ignores them.
+        assert!(is_inside(
+            Path::new(r"\\?\c:\PROGRAM FILES\datasabi\X.EXE"),
+            pf
+        ));
+        assert!(is_inside(
+            Path::new(r"\\?\C:\Program Files\x.exe"),
+            Path::new(r"\\?\c:\program files")
+        ));
+        // Look-alikes and other places.
+        assert!(!is_inside(
+            Path::new(r"\\?\C:\Program Files Evil\x.exe"),
+            pf
+        ));
+        assert!(!is_inside(Path::new(r"\\?\C:\Program Filesx\x.exe"), pf));
+        assert!(!is_inside(Path::new(r"\\?\D:\Program Files\x.exe"), pf));
+        assert!(!is_inside(Path::new(r"\\?\C:\Users\a\Downloads\x.exe"), pf));
+        assert!(!is_inside(pf, pf));
+        // Without the prefix on both, the same answers.
+        assert!(is_inside(
+            Path::new(r"C:\Program Files\DataSabi\x.exe"),
+            Path::new(r"C:\Program Files")
+        ));
+        assert!(!is_inside(
+            Path::new(r"C:\Program Files Evil\x.exe"),
+            Path::new(r"C:\Program Files")
+        ));
+    }
+
+    #[test]
+    fn untrusted_things_are_moved_next_to_themselves() {
+        assert_eq!(
+            aside_name(Path::new("/data/DataSabi"), 1_763_000_000),
+            PathBuf::from("/data/DataSabi.untrusted-1763000000")
+        );
+        assert_eq!(
+            aside_name(Path::new("/data/DataSabi/logs/collector.log"), 5),
+            PathBuf::from("/data/DataSabi/logs/collector.log.untrusted-5")
+        );
+    }
+
+    #[test]
+    fn verbatim_drive_paths_become_plain() {
+        assert_eq!(
+            plain_drive_path(Path::new(r"\\?\C:\Program Files\DataSabi\x.exe")),
+            Some(PathBuf::from(r"C:\Program Files\DataSabi\x.exe"))
+        );
+        assert_eq!(
+            plain_drive_path(Path::new(r"D:\a\x.exe")),
+            Some(PathBuf::from(r"D:\a\x.exe"))
+        );
+        assert_eq!(
+            plain_drive_path(Path::new(r"\\?\UNC\server\share\x.exe")),
+            None
+        );
+        assert_eq!(plain_drive_path(Path::new(r"\\server\share\x.exe")), None);
     }
 }
