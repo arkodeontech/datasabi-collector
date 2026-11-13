@@ -25,11 +25,12 @@ use windows_sys::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid,
     WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 
 use crate::config::data_dir;
@@ -89,9 +90,14 @@ fn secure(
     for _ in 0..3 {
         match kind {
             Kind::Folder => {
-                if let Err(e) = std::fs::create_dir(path) {
+                if let Err(e) = create_dir_secure(path, sd) {
                     if e.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(e).with_context(|| format!("creating {}", path.display()));
+                        return Err(e).with_context(|| {
+                            format!(
+                                "creating {} owned by Administrators (run as administrator)",
+                                path.display()
+                            )
+                        });
                     }
                 }
             }
@@ -114,6 +120,33 @@ fn secure(
         moved.push(move_aside(path)?);
     }
     bail!("{} keeps being replaced by another program", path.display())
+}
+
+/// Makes a folder that is owned by Administrators and has `sd`'s protected access
+/// list from the start, whatever the token's default owner. Git Bash, and the "Object
+/// creator" default-owner policy some organisations set, make it the user's own
+/// account, which [`is_trusted`] rightly refuses (a program running as that user
+/// without admin rights has the same account). Only an administrator or SYSTEM may
+/// set Administrators as the owner.
+fn create_dir_secure(path: &Path, sd: &SecurityDescriptor) -> std::io::Result<()> {
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.as_ptr(),
+        bInheritHandle: 0,
+    };
+    // SAFETY: `wide` is NUL-terminated; `attributes` and the descriptor it points to
+    // live through the call.
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn open_no_follow(path: &Path) -> std::io::Result<File> {
@@ -215,4 +248,29 @@ fn move_aside(path: &Path) -> Result<PathBuf> {
         )
     })?;
     Ok(aside)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder this process makes is owned by Administrators, so the check trusts it
+    /// whatever this process's default owner is. Windows CI runs it from PowerShell
+    /// and from Git Bash (whose programs default to the user's own account).
+    #[test]
+    #[ignore = "sets Administrators as owner, which needs administrator rights"]
+    fn a_new_folder_is_owned_by_administrators() {
+        let dir = std::env::temp_dir().join(format!("datasabi-owner-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&dir);
+        let sd = SecurityDescriptor::from_sddl(DIR_SDDL).unwrap();
+        create_dir_secure(&dir, &sd).unwrap();
+        let item = open_no_follow(&dir).unwrap();
+        let trusted = is_trusted(&item, Kind::Folder).unwrap();
+        drop(item);
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(
+            trusted,
+            "a folder made by the collector itself must be trusted"
+        );
+    }
 }

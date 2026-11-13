@@ -129,6 +129,14 @@ mod imp {
         })
     }
 
+    /// How dsctl lets the pipe's server see it: SECURITY_SQOS_PRESENT |
+    /// SECURITY_IDENTIFICATION, so the server can tell who connected but not
+    /// impersonate them (not SECURITY_IMPERSONATION or SECURITY_DELEGATION). The
+    /// "present" flag is passed explicitly, whether or not std also adds it.
+    #[cfg(windows)]
+    const PIPE_QOS: u32 = windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT
+        | windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
     #[cfg(windows)]
     fn open(cli: &Cli) -> Result<Stream> {
         /// ERROR_PIPE_BUSY: every instance is taken for the moment; the collector
@@ -144,6 +152,8 @@ mod imp {
                 .read(true)
                 .write(true)
                 .access_mode(CLIENT_ACCESS)
+                // The server may identify dsctl's user but not act with their rights.
+                .security_qos_flags(PIPE_QOS)
                 .open(&cli.socket)
             {
                 Ok(f) => {
@@ -430,6 +440,14 @@ mod imp {
             let cli = Cli::try_parse_from(["dsctl", "--socket", name.as_str(), "ping"]).unwrap();
             let err = open(&cli).expect_err("an impostor pipe must be refused");
             assert!(format!("{err:#}").contains("isn't owned by the system"));
+        }
+
+        /// SQOS present, identification level only: 0x0010_0000 | 0x0001_0000
+        /// (impersonation is 0x0002_0000, delegation 0x0003_0000).
+        #[test]
+        fn the_pipe_server_may_only_identify_dsctl() {
+            assert_eq!(PIPE_QOS, 0x0011_0000);
+            assert_eq!(PIPE_QOS & 0x0003_0000, 0x0001_0000);
         }
     }
 }
