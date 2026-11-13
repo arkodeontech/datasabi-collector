@@ -49,6 +49,15 @@ jobs:
       # GitHub's Windows runners have both.
       - run: cargo test -- --ignored
       - run: cargo build --release
+      # The Windows programs, for testing the app against the real service (TODO D2)
+      # before the .msi ships them (D3).
+      - uses: actions/upload-artifact@v7
+        with:
+          name: datasabi-collector-windows
+          path: |
+            target/release/datasabi-collector.exe
+            target/release/dsctl.exe
+          if-no-files-found: error
 
   # The minimum Rust the crates declare (`rust-version` in Cargo.toml, the highest any
   # locked dependency needs): build and test with exactly that version, since the jobs
