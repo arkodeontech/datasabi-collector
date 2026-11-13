@@ -128,8 +128,10 @@ pub fn file_names(path: &str) -> FileNames {
     let mut tables: Vec<String> = Vec::new();
     if let Some(pairs) = query(block, r"\VarFileInfo\Translation") {
         // (language, code page) pairs.
-        for pair in pairs.chunks_exact(2) {
-            tables.push(format!("{:04x}{:04x}", pair[0], pair[1]));
+        let mut rest = pairs.as_slice();
+        while let [lang, code_page, tail @ ..] = rest {
+            tables.push(format!("{lang:04x}{code_page:04x}"));
+            rest = tail;
         }
     }
     tables.extend(["040904b0".to_string(), "040904e4".to_string()]);
@@ -194,7 +196,8 @@ fn query(block: &[u64], sub_block: &str) -> Option<Vec<u16>> {
     } else {
         len as usize
     };
-    if start < block_start || start % 2 != 0 || start + units * 2 > block_end {
+    let aligned = (value as *const u16).is_aligned();
+    if start < block_start || !aligned || start + units * 2 > block_end {
         return None;
     }
     // SAFETY: checked above: inside `block`, aligned for u16, `units` long.
