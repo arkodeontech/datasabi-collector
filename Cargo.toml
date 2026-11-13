@@ -8,7 +8,7 @@ edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Arkodeon Technologies Ltd <isaac@arkodeon.com>"]
 repository = "https://github.com/arkodeontech/datasabi-collector"
-rust-version = "1.82"
+rust-version = "1.89"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
