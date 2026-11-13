@@ -48,6 +48,14 @@ jobs:
       # Tests that need administrator rights and the internet (a real ETW session);
       # GitHub's Windows runners have both.
       - run: cargo test -- --ignored
+      # The install again from Git Bash, whose programs make the user (not
+      # Administrators) the default owner of what they create: the collector must still
+      # make its data folders owned by Administrators (app PR #62's first run).
+      - name: Service install from Git Bash
+        shell: bash
+        run: >-
+          cargo test -- --ignored the_installed_service_answers_over_the_pipe
+          a_new_folder_is_owned_by_administrators
       - run: cargo build --release
       # The Windows programs, for testing the app against the real service (TODO D2)
       # before the .msi ships them (D3).
