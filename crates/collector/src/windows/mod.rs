@@ -25,7 +25,7 @@ use crate::engine::{now_unix, AppInfo, Engine};
 use crate::state::Shared;
 use crate::winrules::{
     app_info, local_and_remote, lost_from_logman, reconcile_minute, AdapterTally, Counters,
-    SYSTEM_PID,
+    FileNames, Service, SYSTEM_PID,
 };
 
 use adapters::{Adapter, Adapters};
@@ -161,7 +161,11 @@ struct Capture {
     adapters_read: Instant,
     /// Program file per process: from start events, or asked of Windows.
     images: HashMap<u32, String>,
-    services: HashMap<u32, Vec<String>>,
+    services: HashMap<u32, Vec<Service>>,
+    /// Each program file's version information, read once per path (lower case).
+    file_names: HashMap<String, FileNames>,
+    /// The real `%ProgramFiles%\WindowsApps`: Store apps are only recognised there.
+    store_root: Option<std::path::PathBuf>,
     services_read: Instant,
     services_dirty: bool,
     app_ids: HashMap<u32, i64>,
@@ -213,6 +217,8 @@ impl Capture {
             services: procs::services_by_pid(),
             services_read: Instant::now(),
             services_dirty: false,
+            file_names: HashMap::new(),
+            store_root: procs::store_root(),
             app_ids: HashMap::new(),
             net_checked: HashMap::new(),
             profiles: HashMap::new(),
@@ -486,8 +492,19 @@ impl Capture {
             None if pid != SYSTEM_PID => self.engine.unknown_app_id()?,
             _ => {
                 let services = self.services.get(&pid).cloned().unwrap_or_default();
-                self.engine
-                    .app_id(&app_info(pid, image.as_deref(), &services))?
+                let files = image.as_deref().map(|i| {
+                    self.file_names
+                        .entry(i.to_lowercase())
+                        .or_insert_with(|| procs::file_names(i))
+                        .clone()
+                });
+                self.engine.app_id(&app_info(
+                    pid,
+                    image.as_deref(),
+                    &services,
+                    files.as_ref(),
+                    self.store_root.as_deref(),
+                ))?
             }
         };
         self.app_ids.insert(pid, id);
