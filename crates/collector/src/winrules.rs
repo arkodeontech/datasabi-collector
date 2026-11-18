@@ -300,6 +300,27 @@ fn good_name(text: Option<&str>, file: &str) -> Option<String> {
     (!vague).then_some(t)
 }
 
+/// Folders only Windows can change, where a program's location proves what it is
+/// (resolved, without the `\\?\` prefix, as process paths show them).
+#[derive(Clone, Debug, Default)]
+pub struct TrustedFolders {
+    /// `%ProgramFiles%\WindowsApps`: Store apps.
+    pub store: Option<PathBuf>,
+    /// `%ProgramData%\Microsoft\Windows Defender\Platform` and
+    /// `%ProgramFiles%\Windows Defender`: Microsoft Defender's own programs.
+    pub defender: Vec<PathBuf>,
+}
+
+/// Microsoft Defender's programs (its engine, core service, network inspection and
+/// command-line scanner), lower case. Named "Microsoft Defender" only inside
+/// [`TrustedFolders::defender`], so a program elsewhere can't take the name.
+const DEFENDER_FILES: &[&str] = &[
+    "msmpeng.exe",
+    "mpdefendercoreservice.exe",
+    "nissrv.exe",
+    "mpcmdrun.exe",
+];
+
 /// A Store (MSIX) app's package from its install folder,
 /// `<store_root>\<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>\…`, where
 /// `store_root` is the real `%ProgramFiles%\WindowsApps` (only Windows can write
@@ -397,8 +418,9 @@ fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
 /// version folders), and a path key would make each update a new app with its history
 /// split. Generic file names ([`GENERIC_FILES`], e.g. `updater.exe`) would merge
 /// different vendors, so they're keyed with their vendor or product folder
-/// (`exe:<folder>\<file>`, the nearest folder that isn't a version or a root). Store
-/// apps (only under `store_root`, the real `%ProgramFiles%\WindowsApps`) are keyed by
+/// (`exe:<folder>\<file>`, the nearest folder that isn't a version or a root).
+/// Microsoft Defender's programs, only in Defender's own folders, are one app. Store
+/// apps (only under the real `%ProgramFiles%\WindowsApps`) are keyed by
 /// their package family (`pkg:<family>`): their folder carries the version, and one
 /// package's programs are one app. Only the name changes when a better one is found;
 /// the key, and so the history, stays. Known limit: any program with a given file name
@@ -408,7 +430,7 @@ pub fn app_info(
     image: Option<&str>,
     services: &[Service],
     files: Option<&FileNames>,
-    store_root: Option<&Path>,
+    folders: Option<&TrustedFolders>,
 ) -> AppInfo {
     if pid == SYSTEM_PID {
         return AppInfo {
@@ -428,6 +450,19 @@ pub fn app_info(
     let friendly = files.and_then(|f| {
         good_name(f.description.as_deref(), file).or_else(|| good_name(f.product.as_deref(), file))
     });
+    let defender_roots = folders.map(|f| f.defender.as_slice()).unwrap_or_default();
+    if DEFENDER_FILES.contains(&lower.as_str())
+        && defender_roots
+            .iter()
+            .any(|root| is_inside(Path::new(image), root))
+    {
+        return AppInfo {
+            key: "windows:defender".into(),
+            name: "Microsoft Defender".into(),
+            exe: Some(image.to_string()),
+        };
+    }
+    let store_root = folders.and_then(|f| f.store.as_deref());
     if let Some((family, short)) = store_package(image, store_root) {
         return AppInfo {
             key: format!("pkg:{}", family.to_ascii_lowercase()),
@@ -1113,7 +1148,11 @@ mod tests {
     #[test]
     fn store_apps_are_one_app_across_updates() {
         let root = native(r"C:\Program Files\WindowsApps");
-        let store = Some(Path::new(&root));
+        let folders = TrustedFolders {
+            store: Some(PathBuf::from(&root)),
+            ..Default::default()
+        };
+        let store = Some(&folders);
         let info = |pid, image: &str, files: Option<&FileNames>| {
             app_info(pid, Some(&native(image)), &[], files, store)
         };
@@ -1149,7 +1188,11 @@ mod tests {
     #[test]
     fn a_path_that_climbs_out_isnt_inside() {
         let root = native(r"C:\Program Files\WindowsApps");
-        let store = Some(Path::new(&root));
+        let folders = TrustedFolders {
+            store: Some(PathBuf::from(&root)),
+            ..Default::default()
+        };
+        let store = Some(&folders);
         // Text inside the Store folder, but `..` leads back out of it.
         let climb = native(r"C:\Program Files\WindowsApps\Pkg_1.0_x64__pub\..\..\x.exe");
         assert_eq!(
@@ -1171,9 +1214,72 @@ mod tests {
     }
 
     #[test]
+    fn defenders_programs_are_microsoft_defender_only_in_its_folders() {
+        let platform = native(r"C:\ProgramData\Microsoft\Windows Defender\Platform");
+        let program_files = native(r"C:\Program Files\Windows Defender");
+        let folders = TrustedFolders {
+            defender: vec![PathBuf::from(&platform), PathBuf::from(&program_files)],
+            ..Default::default()
+        };
+        let info = |image: &str| app_info(80, Some(&native(image)), &[], None, Some(&folders));
+        for image in [
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.25010.11-0\MsMpEng.exe",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.25010.11-0\MpDefenderCoreService.exe",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.25010.11-0\NisSrv.exe",
+            r"C:\Program Files\Windows Defender\MpCmdRun.exe",
+            // Windows ignores case.
+            r"c:\programdata\microsoft\windows defender\platform\4.18.1-0\mpcmdrun.exe",
+        ] {
+            let app = info(image);
+            assert_eq!(
+                (app.key.as_str(), app.name.as_str()),
+                ("windows:defender", "Microsoft Defender"),
+                "{image}"
+            );
+        }
+        // The same names anywhere else are their own programs.
+        for (image, key) in [
+            (r"C:\Users\a\Downloads\MsMpEng.exe", "exe:msmpeng.exe"),
+            (
+                r"C:\Users\a\Downloads\Windows Defender\Platform\MpCmdRun.exe",
+                "exe:mpcmdrun.exe",
+            ),
+            (
+                r"C:\Program Files\Windows Defender Evil\NisSrv.exe",
+                "exe:nissrv.exe",
+            ),
+            // Text inside the folder, but `..` climbs out.
+            (
+                r"C:\Program Files\Windows Defender\..\Evil\MpCmdRun.exe",
+                "exe:mpcmdrun.exe",
+            ),
+        ] {
+            assert_eq!(info(image).key, key, "{image}");
+        }
+        // Other files in Defender's folders aren't Defender by location alone.
+        assert_eq!(
+            info(r"C:\Program Files\Windows Defender\other.exe").key,
+            "exe:other.exe"
+        );
+        // Without the folders known, nothing is.
+        let none = app_info(
+            81,
+            Some(&native(r"C:\Program Files\Windows Defender\MpCmdRun.exe")),
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(none.key, "exe:mpcmdrun.exe");
+    }
+
+    #[test]
     fn a_folder_named_windowsapps_elsewhere_isnt_the_store() {
         let root = native(r"C:\Program Files\WindowsApps");
-        let store = Some(Path::new(&root));
+        let folders = TrustedFolders {
+            store: Some(PathBuf::from(&root)),
+            ..Default::default()
+        };
+        let store = Some(&folders);
         // Anyone can make this folder; the program must not hide inside Spotify.
         let fake = native(
             r"C:\Users\a\Downloads\WindowsApps\SpotifyAB.SpotifyMusic_1.2.3.0_x64__zpdnekdrzrea0\x.exe",
