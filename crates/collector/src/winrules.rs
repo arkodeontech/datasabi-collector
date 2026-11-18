@@ -325,10 +325,14 @@ fn store_package(image: &str, store_root: Option<&Path>) -> Option<(String, Stri
     Some((format!("{name}_{publisher}"), short.to_string()))
 }
 
-/// A svchost's app from the services it runs. One known group (all of Windows Update's
-/// services, say) or a single service: that app, by its friendly name. Several unrelated
-/// services sharing one process (PCs under about 3.5 GB of RAM, B3): one app for that
-/// mix, named after Windows Update if it's among them, otherwise after the first few.
+/// The app every process running a Windows Update service counts as.
+const UPDATE_KEY: &str = "windows:update";
+
+/// A svchost's app from the services it runs. Any update service among them: Windows
+/// Update and Store, one app however the services are spread. One known group or a
+/// single service: that app, by its friendly name. Several unrelated services sharing
+/// one process (PCs under about 3.5 GB of RAM, B3): one app for that mix, named after
+/// the first few.
 fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
     let mut apps: Vec<(String, String)> = services
         .iter()
@@ -346,6 +350,17 @@ fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
         .collect();
     apps.sort();
     apps.dedup();
+    // Any process running an update service is Windows Update and Store: one row,
+    // shared or not. PCs under about 3.5 GB of RAM put the update services in shared
+    // processes, sometimes more than one (B3; Isaac's desktop showed two rows of the
+    // same name), and updates are what people suspect most.
+    if apps.iter().any(|(key, _)| key == UPDATE_KEY) {
+        return AppInfo {
+            key: UPDATE_KEY.into(),
+            name: "Windows Update and Store".into(),
+            exe: Some(image.to_string()),
+        };
+    }
     if let [(key, name)] = apps.as_slice() {
         return AppInfo {
             key: key.clone(),
@@ -358,15 +373,6 @@ fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
         .map(|s| s.name.to_ascii_lowercase())
         .collect();
     names.sort_unstable();
-    // PCs under about 3.5 GB of RAM put the update services in a shared process with
-    // others (B3). Updates are what people suspect most, so they stay recognisable.
-    if apps.iter().any(|(key, _)| key == "windows:update") {
-        return AppInfo {
-            key: format!("svchost:{}", names.join(",")),
-            name: "Windows Update and Store (with other services)".into(),
-            exe: Some(image.to_string()),
-        };
-    }
     let mut shown: Vec<&str> = apps.iter().map(|(_, n)| n.as_str()).collect();
     shown.sort_unstable_by_key(|n| n.to_lowercase());
     shown.dedup();
@@ -936,8 +942,8 @@ mod tests {
     fn a_shared_svchost_is_named_after_its_services() {
         let svchost = r"C:\Windows\System32\svchost.exe";
         let info = |pid, services: &[Service]| app_info(pid, Some(svchost), services, None, None);
-        // Low RAM: the update services share a process with others (B3). Updates stay
-        // recognisable; the key is that mix.
+        // Low RAM: the update services share processes with others, sometimes more
+        // than one (B3; Isaac's desktop). All of them are one app, Windows Update.
         let shared = info(
             20,
             &[
@@ -946,11 +952,18 @@ mod tests {
                 service("Themes", "Themes"),
             ],
         );
-        assert_eq!(shared.key, "svchost:schedule,themes,wuauserv");
-        assert_eq!(
-            shared.name,
-            "Windows Update and Store (with other services)"
+        let other_mix = info(
+            25,
+            &[
+                service("BITS", "Background Intelligent Transfer Service"),
+                service("Winmgmt", "Windows Management Instrumentation"),
+            ],
         );
+        let alone = info(26, &[service("DoSvc", "Delivery Optimization")]);
+        for app in [&shared, &other_mix, &alone] {
+            assert_eq!(app.key, "windows:update");
+            assert_eq!(app.name, "Windows Update and Store");
+        }
         // Without them: named after the first few.
         let others = info(
             21,
