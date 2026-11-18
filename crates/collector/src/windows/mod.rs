@@ -25,7 +25,7 @@ use crate::engine::{now_unix, AppInfo, Engine};
 use crate::state::Shared;
 use crate::winrules::{
     app_info, local_and_remote, lost_from_logman, reconcile_minute, AdapterTally, Counters,
-    FileNames, Service, SYSTEM_PID,
+    FileNames, Service, TrustedFolders, SYSTEM_PID,
 };
 
 use adapters::{Adapter, Adapters};
@@ -164,8 +164,9 @@ struct Capture {
     services: HashMap<u32, Vec<Service>>,
     /// Each program file's version information, read once per path (lower case).
     file_names: HashMap<String, FileNames>,
-    /// The real `%ProgramFiles%\WindowsApps`: Store apps are only recognised there.
-    store_root: Option<std::path::PathBuf>,
+    /// Folders only Windows can change (the Store's, Defender's), where a program's
+    /// location proves what it is.
+    trusted_folders: TrustedFolders,
     services_read: Instant,
     services_dirty: bool,
     app_ids: HashMap<u32, i64>,
@@ -218,7 +219,7 @@ impl Capture {
             services_read: Instant::now(),
             services_dirty: false,
             file_names: HashMap::new(),
-            store_root: procs::store_root(),
+            trusted_folders: procs::trusted_folders(),
             app_ids: HashMap::new(),
             net_checked: HashMap::new(),
             profiles: HashMap::new(),
@@ -503,7 +504,7 @@ impl Capture {
                     image.as_deref(),
                     &services,
                     files.as_ref(),
-                    self.store_root.as_deref(),
+                    Some(&self.trusted_folders),
                 ))?
             }
         };

@@ -37,7 +37,7 @@ pub fn image_path(pid: u32) -> Option<String> {
 
 use std::path::PathBuf;
 
-use crate::winrules::{plain_drive_path, version_info_size_ok, FileNames, Service};
+use crate::winrules::{plain_drive_path, version_info_size_ok, FileNames, Service, TrustedFolders};
 
 /// The running Win32 services per process id (svchost processes run several), with
 /// their display names.
@@ -156,15 +156,35 @@ pub fn file_names(path: &str) -> FileNames {
     FileNames::default()
 }
 
-/// The real Store app folder, `%ProgramFiles%\WindowsApps` (only Windows can write
-/// there), as process paths show it: resolved and without the `\\?\` prefix. `None`
-/// if Program Files can't be resolved, and then no program counts as a Store app.
-pub fn store_root() -> Option<PathBuf> {
-    let program_files = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    let resolved = std::fs::canonicalize(program_files).ok()?;
-    Some(plain_drive_path(&resolved)?.join("WindowsApps"))
+/// The folders only Windows can change that name programs ([`TrustedFolders`]):
+/// `%ProgramFiles%\WindowsApps` (Store apps) and Microsoft Defender's
+/// `%ProgramData%\Microsoft\Windows Defender\Platform` and
+/// `%ProgramFiles%\Windows Defender`. Each is resolved and written without the
+/// `\\?\` prefix, as process paths show it; one that can't be resolved is left out,
+/// so nothing is named by it.
+pub fn trusted_folders() -> TrustedFolders {
+    let env_dir = |var: &str, fallback: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(fallback))
+    };
+    let resolved = |path: PathBuf| {
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| plain_drive_path(&p))
+    };
+    let program_files = env_dir("ProgramFiles", r"C:\Program Files");
+    let program_data = env_dir("ProgramData", r"C:\ProgramData");
+    TrustedFolders {
+        store: resolved(program_files.clone()).map(|p| p.join("WindowsApps")),
+        defender: [
+            program_data.join(r"Microsoft\Windows Defender\Platform"),
+            program_files.join("Windows Defender"),
+        ]
+        .into_iter()
+        .filter_map(resolved)
+        .collect(),
+    }
 }
 
 /// A value from a version information block, as UTF-16 units (strings) or u16 pairs
@@ -236,11 +256,15 @@ mod tests {
             "{explorer:?}"
         );
         assert_eq!(file_names(r"C:\no\such\file.exe"), FileNames::default());
-        let store = store_root().expect("Program Files resolves");
+        let folders = trusted_folders();
+        let store = folders.store.expect("Program Files resolves");
         assert!(
             store.ends_with("WindowsApps") && store.is_absolute(),
             "{store:?}"
         );
+        // GitHub's runners have Microsoft Defender, with both of its folders.
+        assert_eq!(folders.defender.len(), 2, "{:?}", folders.defender);
+        assert!(folders.defender.iter().all(|d| d.is_absolute()));
         let services = services_by_pid();
         assert!(
             services.values().flatten().any(|s| !s.display.is_empty()),
