@@ -346,14 +346,18 @@ fn store_package(image: &str, store_root: Option<&Path>) -> Option<(String, Stri
     Some((format!("{name}_{publisher}"), short.to_string()))
 }
 
-/// The app every process running a Windows Update service counts as.
+/// The app a process running only Windows Update's services counts as.
 const UPDATE_KEY: &str = "windows:update";
+/// The one app every process that shares an update service with other services
+/// counts as (PCs under about 3.5 GB of RAM, B3).
+const UPDATE_SHARED_KEY: &str = "windows:update-shared";
 
-/// A svchost's app from the services it runs. Any update service among them: Windows
-/// Update and Store, one app however the services are spread. One known group or a
-/// single service: that app, by its friendly name. Several unrelated services sharing
-/// one process (PCs under about 3.5 GB of RAM, B3): one app for that mix, named after
-/// the first few.
+/// A svchost's app from the services it runs. Only Windows Update's services: Windows
+/// Update and Store. Update services sharing the process with others: one shared app
+/// for all such processes, as Windows counts data per process, not per service, so
+/// the others' data can't be told apart (it isn't claimed as updates). One known group
+/// or a single service: that app, by its friendly name. Several unrelated services
+/// sharing one process: one app for that mix, named after the first few.
 fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
     let mut apps: Vec<(String, String)> = services
         .iter()
@@ -371,14 +375,26 @@ fn svchost_info(image: &str, services: &[Service]) -> AppInfo {
         .collect();
     apps.sort();
     apps.dedup();
-    // Any process running an update service is Windows Update and Store: one row,
-    // shared or not. PCs under about 3.5 GB of RAM put the update services in shared
-    // processes, sometimes more than one (B3; Isaac's desktop showed two rows of the
-    // same name), and updates are what people suspect most.
+    // Updates are what people suspect most, so they stay recognisable. A process
+    // running only update services is Windows Update and Store. One sharing them with
+    // other services (low RAM; sometimes several such processes, as on a 3.46 GB
+    // test desktop) can't be split by service, so all of those are one separate row that
+    // says so, never two rows of the same name and never others' data as updates.
     if apps.iter().any(|(key, _)| key == UPDATE_KEY) {
+        let only_updates = apps.iter().all(|(key, _)| key == UPDATE_KEY);
         return AppInfo {
-            key: UPDATE_KEY.into(),
-            name: "Windows Update and Store".into(),
+            key: if only_updates {
+                UPDATE_KEY
+            } else {
+                UPDATE_SHARED_KEY
+            }
+            .into(),
+            name: if only_updates {
+                "Windows Update and Store"
+            } else {
+                "Windows Update and Store (shared with other services)"
+            }
+            .into(),
             exe: Some(image.to_string()),
         };
     }
@@ -978,7 +994,8 @@ mod tests {
         let svchost = r"C:\Windows\System32\svchost.exe";
         let info = |pid, services: &[Service]| app_info(pid, Some(svchost), services, None, None);
         // Low RAM: the update services share processes with others, sometimes more
-        // than one (B3; Isaac's desktop). All of them are one app, Windows Update.
+        // than one (B3; a 3.46 GB test desktop). All such processes are one shared app, apart
+        // from processes running only update services.
         let shared = info(
             20,
             &[
@@ -994,8 +1011,23 @@ mod tests {
                 service("Winmgmt", "Windows Management Instrumentation"),
             ],
         );
+        for app in [&shared, &other_mix] {
+            assert_eq!(app.key, "windows:update-shared");
+            assert_eq!(
+                app.name,
+                "Windows Update and Store (shared with other services)"
+            );
+        }
+        // Only update services, one or several: Windows Update and Store.
         let alone = info(26, &[service("DoSvc", "Delivery Optimization")]);
-        for app in [&shared, &other_mix, &alone] {
+        let pure = info(
+            27,
+            &[
+                service("wuauserv", "Windows Update"),
+                service("UsoSvc", "Update Orchestrator Service"),
+            ],
+        );
+        for app in [&alone, &pure] {
             assert_eq!(app.key, "windows:update");
             assert_eq!(app.name, "Windows Update and Store");
         }
