@@ -1,5 +1,5 @@
 //! Connection profiles (Windows.Networking.Connectivity): each connected adapter's
-//! network name ("Isaac's Galaxy A12", the Wi-Fi name) and Windows' cost setting for it.
+//! network name (for example, "Phone hotspot") and Windows' cost setting for it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
