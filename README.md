@@ -87,6 +87,7 @@ Privacy:
 - **Very short connections** that open and close in under ~100 ms may land in "Unknown / system".
 - **Hotspot sharing:** traffic this computer forwards for other devices is not counted.
 - **Windows: apps are known by their program's file name.** Any program called `chrome.exe` is counted with Chrome, wherever it lives. This keeps an app's history together when it updates into a new version folder, which many Windows apps do. Generic names such as `updater.exe` are told apart by their vendor's folder, and Store apps by their package (only in Windows' own `WindowsApps` folder).
+- **Windows: network use is counted per process.** Some update services can share a process with other services, especially on PCs with less memory. DataSabi shows traffic from those processes together as "Windows Update and Store (shared with other services)" because the traffic can't be split by service. BITS also handles background transfers for other programs, so "Windows Update and Store" can include traffic from those transfers.
 - **Windows: names come from the program itself.** The name shown is the program's own description where it has a sensible one. A program can't take DataSabi's own row names ("Windows Update and Store", "Microsoft Defender", "Other (Windows)"…), even with hidden characters or look-alike spaces; it then shows its file name. Look-alike letters (a Cyrillic "і" for a Latin "i", for example) can't be ruled out, so a name that looks like a trusted one isn't proof of what the program is.
 
 ## Build from source
